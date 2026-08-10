@@ -25,9 +25,24 @@ from mdd_forecasting.io import (
 )
 from mdd_forecasting.model import run_forecasting
 from mdd_forecasting.report import write_results_workbook
+from uruchom_model import MODEL_BACKEND, MIN_LEAD_HOURS, build_cli_args
 
 
 class TestMddForecasting(unittest.TestCase):
+    def test_click_launcher_builds_portable_arguments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = build_cli_args(
+                Path(tmp) / "energia.xlsx",
+                Path(tmp) / "wyniki",
+            )
+        self.assertEqual(args[args.index("--model-backend") + 1], MODEL_BACKEND)
+        self.assertEqual(
+            args[args.index("--min-lead-hours") + 1], str(MIN_LEAD_HOURS)
+        )
+        sql_path = Path(args[args.index("--weather-sql") + 1])
+        self.assertTrue(sql_path.exists())
+        self.assertNotIn("10200871", " ".join(args))
+
     def test_lag_window_uses_same_hour_from_day_3_to_day_14(self):
         dates = pd.date_range("2025-01-01", periods=15, freq="D")
         frame = pd.DataFrame(
