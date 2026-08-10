@@ -30,10 +30,30 @@ Na komputerze służbowym nie trzeba wpisywać żadnych ścieżek do kodu:
 Launcher zawsze odnajduje SQL względem folderu repozytorium, używa CatBoost,
 `min-lead-hours=24` i nie przechowuje żadnej prywatnej ani służbowej ścieżki.
 
+Launcher działa teraz w profilu `fast_30min`, przygotowanym dla laptopa służbowego:
+
+- wybiera **najnowsze 150 000 wierszy** z końcowych arkuszy `Dane_*`, zamiast
+  ładować kilka milionów rekordów do RAM;
+- wykonuje jeden siedmiodniowy backtest i dwa modele końcowe, czyli najwyżej cztery
+  fity zamiast ośmiu;
+- używa najwyżej 60 000 rekordów treningowych na kierunek, 60 iteracji i głębokości 6;
+- zatrzymuje pojedynczy fit CatBoost po najbliższej iteracji po przekroczeniu 3 minut;
+- wyłącza kosztowną permutacyjną ważność cech i zapisuje kompaktowy raport;
+- przerywa zapytanie SQL po 5 minutach zamiast czekać bez końca;
+- pokazuje czas i postęp: Excel, SQL, łączenie, cechy, każdy fit oraz zapis.
+
+Celem jest około **20–30 minut uczenia** na typowym laptopie, ale całkowity czas może
+być dłuższy, jeżeli firmowy SQL albo odczyt XLSX jest wolny. Szybki raport świadomie
+obejmuje tylko najnowszy wycinek; liczba pominiętych wierszy i zakres konfiguracji są
+zapisane w `Kontrola_jakosci` i `Konfiguracja`. Pełny pipeline bez limitu pozostaje
+dostępny przez ręczne uruchomienie CLI w profilu `standard`.
+
 ## Ziarno danych i mapowanie
 
-Jedna obserwacja modelu to jeden oryginalny wiersz Excela. Arkusze `Dane_01`,
-`Dane_02`, ... są scalane, ale zachowane zostają `source_sheet` i `source_row`.
+Jedna obserwacja modelu to jeden oryginalny wiersz Excela. W profilu standardowym
+arkusze `Dane_01`, `Dane_02`, ... są scalane w całości. Launcher `fast_30min` czyta
+z nich najnowszy wycinek, ale w obu trybach zachowane zostają `source_sheet` i
+`source_row`.
 Kolumny A:I są czytane pozycyjnie, ponieważ na zdjęciach A i D mają ten sam nagłówek
 `Nazwa`:
 
@@ -194,8 +214,9 @@ Metryki są liczone globalnie, według kierunku, miasta, statusu dostępności p
 jako średnia makro po klientach. Porównanie błędów „z pogodą / bez pogody” jest
 diagnostyką zakresów, a nie dowodem przyczynowego wpływu pogody, bo okresy mogą różnić
 się sezonem i składem klientów. Wpływ samych cech pogodowych należy później potwierdzić
-testem ablation na identycznych wierszach. Ważność cech jest mierzona permutacyjnie na
-danych testowych, osobno dla pobrania i oddania.
+testem ablation na identycznych wierszach. W profilu pełnym ważność cech jest mierzona
+permutacyjnie na danych testowych, osobno dla pobrania i oddania. Profil szybki pomija
+ten etap, ponieważ był jednym z największych kosztów czasowych.
 
 ## Uruchomienie bezpośrednio z SQL Server
 

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from mdd_forecasting.cli import _infer_sql_date_range
+from mdd_forecasting.cli import _infer_sql_date_range, _parser, _validate_args
 from mdd_forecasting.config import PipelineConfig, WEATHER_FEATURES
 from mdd_forecasting.database import (
     SqlServerSettings,
@@ -22,12 +22,25 @@ from mdd_forecasting.io import (
     normalize_energy,
     normalize_weather,
     prepare_joined_dataset,
+    read_energy_file,
 )
-from mdd_forecasting.model import run_forecasting
+from mdd_forecasting.model import _CatBoostTimeLimit, run_forecasting
 from mdd_forecasting.report import write_results_workbook
 from uruchom_model import (
+    CATBOOST_DEPTH,
+    EXECUTION_PROFILE,
+    FOLDS,
+    INPUT_ROW_SELECTION,
+    MAX_FIT_MINUTES,
+    MAX_INPUT_ROWS,
+    MAX_ITER,
+    MAX_TRAIN_ROWS,
     MODEL_BACKEND,
+    MODEL_PROGRESS_INTERVAL,
     MIN_LEAD_HOURS,
+    SQL_QUERY_TIMEOUT_SECONDS,
+    SQL_CONNECT_TIMEOUT_SECONDS,
+    VALIDATION_DAYS,
     WEATHER_AVAILABLE_FROM,
     build_cli_args,
 )
@@ -48,9 +61,77 @@ class TestMddForecasting(unittest.TestCase):
             args[args.index("--weather-available-from") + 1],
             WEATHER_AVAILABLE_FROM,
         )
+        expected_options = {
+            "--execution-profile": EXECUTION_PROFILE,
+            "--max-input-rows": str(MAX_INPUT_ROWS),
+            "--input-row-selection": INPUT_ROW_SELECTION,
+            "--validation-days": str(VALIDATION_DAYS),
+            "--folds": str(FOLDS),
+            "--max-train-rows": str(MAX_TRAIN_ROWS),
+            "--max-iter": str(MAX_ITER),
+            "--catboost-depth": str(CATBOOST_DEPTH),
+            "--max-fit-minutes": str(MAX_FIT_MINUTES),
+            "--model-progress-interval": str(MODEL_PROGRESS_INTERVAL),
+            "--sql-query-timeout": str(SQL_QUERY_TIMEOUT_SECONDS),
+            "--sql-connect-timeout": str(SQL_CONNECT_TIMEOUT_SECONDS),
+        }
+        for option, expected in expected_options.items():
+            self.assertEqual(args[args.index(option) + 1], expected)
+        self.assertIn("--skip-importance", args)
+        self.assertIn("--compact-output", args)
         sql_path = Path(args[args.index("--weather-sql") + 1])
         self.assertTrue(sql_path.exists())
         self.assertNotIn("10200871", " ".join(args))
+
+    def test_fast_profile_rejects_invalid_limits(self):
+        args = _parser().parse_args(
+            [
+                "--energy",
+                "energia.xlsx",
+                "--weather",
+                "pogoda.csv",
+                "--output-dir",
+                "wyniki",
+            ]
+        )
+        args.folds = 0
+        with self.assertRaisesRegex(ValueError, "dodatnie"):
+            _validate_args(args)
+
+        args.folds = 1
+        args.min_train_rows = 500
+        args.max_train_rows = 100
+        with self.assertRaisesRegex(ValueError, "max-train-rows"):
+            _validate_args(args)
+
+    def test_tail_input_keeps_newest_excel_rows(self):
+        from openpyxl import Workbook
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "energia.xlsx"
+            workbook = Workbook()
+            old = workbook.active
+            old.title = "Dane_01"
+            new = workbook.create_sheet("Dane_02")
+            header = ["Nazwa", "Kierunek", "Grupa", "Nazwa", "Kierunek", "Doba", "Rodzaj", "Godzina", "Wartość"]
+            for sheet in (old, new):
+                sheet.append(header)
+            for day in range(1, 4):
+                old.append(["BIA", 1, "G", "K", "czynne pobranie", f"2024-01-0{day}", 4, 1, day])
+            for day in range(1, 5):
+                new.append(["LUB", -1, "G", "K", "czynne oddanie", f"2025-02-0{day}", 4, 1, day])
+            workbook.save(path)
+
+            selected = read_energy_file(path, max_rows=3, row_selection="tail")
+            self.assertEqual(len(selected), 3)
+            self.assertEqual(set(selected["source_sheet"]), {"Dane_02"})
+            self.assertEqual(
+                selected["doba_handlowa"].astype(str).tolist(),
+                ["2025-02-02", "2025-02-03", "2025-02-04"],
+            )
+            self.assertEqual(
+                int(selected.attrs["source_rows_total_estimate"]), 7
+            )
 
     def test_lag_window_uses_same_hour_from_day_3_to_day_14(self):
         dates = pd.date_range("2025-01-01", periods=15, freq="D")
@@ -74,6 +155,51 @@ class TestMddForecasting(unittest.TestCase):
         self.assertNotIn("lag_48h", with_lags.columns)
         self.assertEqual(last["lag_srednia_3_14_dni"], 6.5)
         self.assertEqual(last["wartosc_bazowa"], 6.5)
+
+    def test_catboost_time_callback_stops_after_deadline(self):
+        with patch(
+            "mdd_forecasting.model.time.monotonic", side_effect=[0.0, 1.0, 4.0]
+        ):
+            callback = _CatBoostTimeLimit(3.0)
+            self.assertTrue(callback.after_iteration(None))
+            self.assertFalse(callback.after_iteration(None))
+            self.assertTrue(callback.stopped_by_time)
+
+    def test_fast_profile_runs_at_most_four_bounded_fits(self):
+        class FakeModel:
+            _mdd_stopped_by_time = False
+
+            def predict(self, frame):
+                return [0.0] * len(frame)
+
+        fit_sizes: list[int] = []
+
+        def fake_fit(train, _spec, _config):
+            fit_sizes.append(len(train))
+            return FakeModel()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            energy_path, weather_path = generate(Path(tmp), days=20, seed=9)
+            config = PipelineConfig(
+                execution_profile="fast_30min",
+                validation_days=3,
+                n_splits=1,
+                min_train_rows=50,
+                max_train_rows=100,
+                max_iter=60,
+                compute_importance=False,
+            )
+            joined, _, _ = prepare_joined_dataset(
+                energy_path, weather_path, config=config
+            )
+            messages: list[str] = []
+            with patch("mdd_forecasting.model._fit_log_model", side_effect=fake_fit):
+                run_forecasting(joined, config, progress_callback=messages.append)
+
+        self.assertEqual(len(fit_sizes), 4)
+        self.assertLessEqual(max(fit_sizes), 100)
+        self.assertTrue(any("12 lagów" in message for message in messages))
+        self.assertTrue(any("Model końcowy POBRANIE" in message for message in messages))
 
     def test_sql_parameters_and_integrated_connection(self):
         params = weather_query_parameters("2025-01-01", "2025-02-01", 24)

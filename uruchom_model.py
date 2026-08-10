@@ -16,6 +16,18 @@ SQL_PATH = BASE_DIR / "mdd_forecasting" / "sql" / "pogoda_mdd.sql"
 MODEL_BACKEND = "catboost"
 MIN_LEAD_HOURS = 24
 WEATHER_AVAILABLE_FROM = "2024-10-01"
+EXECUTION_PROFILE = "fast_30min"
+MAX_INPUT_ROWS = 150_000
+INPUT_ROW_SELECTION = "tail"
+VALIDATION_DAYS = 7
+FOLDS = 1
+MAX_TRAIN_ROWS = 60_000
+MAX_ITER = 60
+CATBOOST_DEPTH = 6
+MAX_FIT_MINUTES = 3.0
+MODEL_PROGRESS_INTERVAL = 15
+SQL_QUERY_TIMEOUT_SECONDS = 300
+SQL_CONNECT_TIMEOUT_SECONDS = 15
 
 
 def build_cli_args(
@@ -40,6 +52,32 @@ def build_cli_args(
         str(int(min_lead_hours)),
         "--weather-available-from",
         str(weather_available_from),
+        "--execution-profile",
+        EXECUTION_PROFILE,
+        "--max-input-rows",
+        str(MAX_INPUT_ROWS),
+        "--input-row-selection",
+        INPUT_ROW_SELECTION,
+        "--validation-days",
+        str(VALIDATION_DAYS),
+        "--folds",
+        str(FOLDS),
+        "--max-train-rows",
+        str(MAX_TRAIN_ROWS),
+        "--max-iter",
+        str(MAX_ITER),
+        "--catboost-depth",
+        str(CATBOOST_DEPTH),
+        "--max-fit-minutes",
+        str(MAX_FIT_MINUTES),
+        "--model-progress-interval",
+        str(MODEL_PROGRESS_INTERVAL),
+        "--sql-query-timeout",
+        str(SQL_QUERY_TIMEOUT_SECONDS),
+        "--sql-connect-timeout",
+        str(SQL_CONNECT_TIMEOUT_SECONDS),
+        "--skip-importance",
+        "--compact-output",
     ]
 
 
@@ -100,7 +138,9 @@ def main() -> int:
             f"Dane energii:\n{energy}\n\n"
             f"Wyniki:\n{output}\n\n"
             f"Model: {MODEL_BACKEND}\nMinimalny lead pogody: {MIN_LEAD_HOURS} h\n"
-            f"Początek danych pogodowych: {WEATHER_AVAILABLE_FROM}",
+            f"Początek danych pogodowych: {WEATHER_AVAILABLE_FROM}\n\n"
+            "Profil szybki: najnowsze 150 000 wierszy, 1 backtest, "
+            "maks. 3 minuty na pojedynczy model.",
             parent=root,
         )
         if not confirmed:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -64,13 +65,35 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-train-rows", type=int, default=1_000_000)
     parser.add_argument("--max-iter", type=int, default=220)
     parser.add_argument(
+        "--execution-profile",
+        choices=["standard", "fast_30min"],
+        default="standard",
+    )
+    parser.add_argument(
         "--model-backend",
         choices=["hist_gradient_boosting", "catboost"],
         default="hist_gradient_boosting",
     )
     parser.add_argument("--catboost-depth", type=int, default=8)
     parser.add_argument("--max-input-rows", type=int)
+    parser.add_argument(
+        "--input-row-selection",
+        choices=["head", "tail"],
+        default="head",
+        help="Przy limicie wejścia wybierz pierwsze albo najnowsze wiersze.",
+    )
+    parser.add_argument(
+        "--max-fit-minutes",
+        type=float,
+        help="Limit czasu pojedynczego fitu CatBoost; sprawdzany po każdej iteracji.",
+    )
+    parser.add_argument("--model-progress-interval", type=int, default=0)
     parser.add_argument("--skip-importance", action="store_true")
+    parser.add_argument(
+        "--compact-output",
+        action="store_true",
+        help="Zapisz w predykcjach tylko najważniejsze kolumny, aby skrócić eksport.",
+    )
     parser.add_argument(
         "--weather-already-vintaged",
         action="store_true",
@@ -104,7 +127,31 @@ def _write_csv(frame: pd.DataFrame, path: Path) -> None:
     )
 
 
-def _prediction_columns(frame: pd.DataFrame) -> list[str]:
+def _prediction_columns(frame: pd.DataFrame, compact: bool = False) -> list[str]:
+    if compact:
+        preferred = [
+            "source_sheet",
+            "source_row",
+            "oddzial_code",
+            "punkt",
+            "grupa",
+            "klient_nazwa",
+            "kierunek_energii_norm",
+            "doba_handlowa",
+            "godzina_handlowa",
+            "wartosc_rzeczywista",
+            "wartosc_przewidywana",
+            "wartosc_bazowa_backtest",
+            "blad",
+            "blad_bezwzgledny",
+            "status_predykcji",
+            "prognoza_bez_pogody",
+            "fold",
+            "weather_status",
+            "pogoda_dopasowana",
+            "liczba_cech_pogodowych",
+        ]
+        return [col for col in preferred if col in frame.columns]
     preferred = [
         "source_sheet",
         "source_row",
@@ -145,6 +192,30 @@ def _prediction_columns(frame: pd.DataFrame) -> list[str]:
     return [col for col in preferred if col in frame.columns]
 
 
+def _validate_args(args: argparse.Namespace) -> None:
+    positive = {
+        "--validation-days": args.validation_days,
+        "--folds": args.folds,
+        "--min-train-rows": args.min_train_rows,
+        "--max-train-rows": args.max_train_rows,
+        "--max-iter": args.max_iter,
+        "--catboost-depth": args.catboost_depth,
+    }
+    if args.max_input_rows is not None:
+        positive["--max-input-rows"] = args.max_input_rows
+    if args.max_fit_minutes is not None:
+        positive["--max-fit-minutes"] = args.max_fit_minutes
+    invalid = [name for name, value in positive.items() if value <= 0]
+    if invalid:
+        raise ValueError(f"Parametry muszą być dodatnie: {', '.join(invalid)}")
+    if args.max_train_rows < args.min_train_rows:
+        raise ValueError("--max-train-rows nie może być mniejsze od --min-train-rows.")
+    if args.sql_query_timeout < 0:
+        raise ValueError("--sql-query-timeout nie może być ujemny.")
+    if args.model_progress_interval < 0:
+        raise ValueError("--model-progress-interval nie może być ujemny.")
+
+
 def _infer_sql_date_range(
     energy: pd.DataFrame,
     valid_from_arg: str | None,
@@ -182,11 +253,21 @@ def _infer_sql_date_range(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    _validate_args(args)
+    run_started = time.monotonic()
+
+    def progress(message: str) -> None:
+        elapsed = int(time.monotonic() - run_started)
+        minutes, seconds = divmod(elapsed, 60)
+        print(f"[{minutes:02d}:{seconds:02d}] {message}", flush=True)
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     config = PipelineConfig(
         min_lead_hours=args.min_lead_hours,
         weather_available_from=args.weather_available_from,
+        execution_profile=args.execution_profile,
+        input_row_selection=args.input_row_selection,
         validation_days=args.validation_days,
         n_splits=args.folds,
         min_train_rows=args.min_train_rows,
@@ -194,6 +275,12 @@ def main(argv: list[str] | None = None) -> int:
         max_iter=args.max_iter,
         model_backend=args.model_backend,
         catboost_depth=args.catboost_depth,
+        max_fit_seconds=(
+            args.max_fit_minutes * 60.0
+            if args.max_fit_minutes is not None
+            else None
+        ),
+        model_progress_interval=args.model_progress_interval,
         compute_importance=not args.skip_importance,
         mapping_path=Path(args.mapping),
         weather_already_vintaged=args.weather_already_vintaged,
@@ -201,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
 
     source_info: dict[str, object]
     if args.weather:
+        progress("1/6 Czytam ograniczony zbiór energii i plik pogody...")
         joined, quality, mapping = prepare_joined_dataset(
             args.energy,
             args.weather,
@@ -212,9 +300,15 @@ def main(argv: list[str] | None = None) -> int:
             "weather_path": str(Path(args.weather)),
             "weather_available_from": config.weather_available_from,
         }
+        progress(f"Dane przygotowane: {len(joined):,} wierszy.")
     else:
+        progress("1/6 Czytam dane energii z Excela...")
         energy, energy_quality, mapping = prepare_energy_dataset(
             args.energy, config=config, max_rows=args.max_input_rows
+        )
+        progress(
+            f"Odczyt zakończony: {len(energy):,} wierszy "
+            f"({config.input_row_selection})."
         )
         valid_from, valid_to = _infer_sql_date_range(
             energy,
@@ -232,7 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         sql_was_skipped = valid_from is None
         if sql_was_skipped:
-            print(
+            progress(
                 "Cały zakres energii jest sprzed początku danych pogodowych "
                 f"({config.weather_available_from}); pomijam zapytanie SQL."
             )
@@ -240,8 +334,8 @@ def main(argv: list[str] | None = None) -> int:
                 columns=["punkt", "dataGodzinaCET", "czasDanychZrodlaCET"]
             )
         else:
-            print(
-                "Pobieram pogodę z "
+            progress(
+                "2/6 Pobieram pogodę z "
                 f"{settings.server} / {settings.database}: "
                 f"{valid_from} <= valid time < {valid_to}"
             )
@@ -255,8 +349,10 @@ def main(argv: list[str] | None = None) -> int:
                 weather_type=args.sql_weather_type,
                 query_timeout_seconds=args.sql_query_timeout,
             )
+            progress(f"SQL zakończony: {len(weather_raw):,} wierszy pogody.")
         if weather_raw.empty and not sql_was_skipped:
             raise ValueError("Zapytanie SQL nie zwróciło żadnych rekordów pogody.")
+        progress("3/6 Łączę energię z pogodą...")
         joined, quality, mapping = join_prepared_energy_with_weather(
             energy,
             energy_quality,
@@ -264,6 +360,7 @@ def main(argv: list[str] | None = None) -> int:
             weather_raw,
             config,
         )
+        progress(f"Łączenie zakończone: {len(joined):,} wierszy.")
         sql_quality = pd.DataFrame(
             [
                 ["zrodlo_pogody", len(weather_raw), "SQL Server"],
@@ -290,7 +387,35 @@ def main(argv: list[str] | None = None) -> int:
             "connection_string_from_env": bool(os.getenv("MDD_SQL_CONNECTION_STRING")),
             "weather_available_from": config.weather_available_from,
         }
-    result = run_forecasting(joined, config)
+    source_info.update(
+        {
+            "execution_profile": config.execution_profile,
+            "max_input_rows": args.max_input_rows,
+            "input_row_selection": config.input_row_selection,
+            "compact_output": bool(args.compact_output),
+        }
+    )
+    profile_quality = pd.DataFrame(
+        [
+            ["profil_uruchomienia", len(joined), config.execution_profile],
+            [
+                "limit_wierszy_wejscia",
+                args.max_input_rows or 0,
+                f"wybór={config.input_row_selection}; 0 oznacza brak limitu",
+            ],
+            [
+                "limit_czasu_pojedynczego_fitu_sekundy",
+                int(config.max_fit_seconds or 0),
+                "dotyczy CatBoost; 0 oznacza brak limitu",
+            ],
+        ],
+        columns=["kontrola", "liczba", "szczegoly"],
+    )
+    quality = pd.concat([quality, profile_quality], ignore_index=True)
+
+    progress("4/6 Buduję cechy i uruchamiam uczenie...")
+    result = run_forecasting(joined, config, progress_callback=progress)
+    progress("Uczenie i predykcja zakończone.")
     predictions = result.predictions
     model_quality = pd.DataFrame(
         [
@@ -313,7 +438,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     quality = pd.concat([quality, model_quality], ignore_index=True)
 
-    columns = _prediction_columns(predictions)
+    progress("5/6 Zapisuję kompaktowe CSV i modele...")
+    columns = _prediction_columns(predictions, compact=args.compact_output)
     if predictions["source_sheet"].nunique(dropna=False) > 1:
         for sheet_name, group in predictions.groupby("source_sheet", dropna=False, sort=False):
             safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(sheet_name))
@@ -347,6 +473,7 @@ def main(argv: list[str] | None = None) -> int:
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    progress("6/6 Tworzę raport Excel...")
     workbook_path = write_results_workbook(
         predictions=predictions,
         prediction_columns=columns,
@@ -358,8 +485,8 @@ def main(argv: list[str] | None = None) -> int:
         manifest=manifest,
         output_path=output_dir / "wyniki_mdd.xlsx",
     )
-    print(f"Raport Excel: {workbook_path.resolve()}")
-    print(f"Gotowe. Wyniki zapisano w: {output_dir.resolve()}")
+    progress(f"Raport Excel: {workbook_path.resolve()}")
+    progress(f"Gotowe. Wyniki zapisano w: {output_dir.resolve()}")
     return 0
 
 

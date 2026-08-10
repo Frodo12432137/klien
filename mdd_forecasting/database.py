@@ -143,10 +143,19 @@ def query_weather_sql(
     try:
         if query_timeout_seconds > 0:
             connection.timeout = int(query_timeout_seconds)
-        if params is None:
-            frame = pd.read_sql_query(sql_text, connection)
-        else:
-            frame = pd.read_sql_query(sql_text, connection, params=params)
+        # pandas emituje ogólne ostrzeżenie dla każdego połączenia DBAPI2 innego niż
+        # sqlite. pyodbc jest tutaj świadomie testowany; komunikat nie oznacza błędu
+        # i tylko niepotrzebnie sugerował użytkownikowi, że model się zatrzymał.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="pandas only supports SQLAlchemy connectable.*",
+                category=UserWarning,
+            )
+            if params is None:
+                frame = pd.read_sql_query(sql_text, connection)
+            else:
+                frame = pd.read_sql_query(sql_text, connection, params=params)
     finally:
         connection.close()
     frame.columns = [str(column).strip() for column in frame.columns]
