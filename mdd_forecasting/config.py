@@ -94,6 +94,7 @@ class PipelineConfig:
     """Parametry jawne, aby backtest odpowiadał sposobowi pracy operacyjnej."""
 
     min_lead_hours: int = 24
+    weather_available_from: str = "2024-10-01"
     lag_days: tuple[int, ...] = tuple(range(3, 15))
     timezone: str = "Europe/Warsaw"
     validation_days: int = 14

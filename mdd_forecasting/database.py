@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -110,17 +111,30 @@ def query_weather_sql(
 
     sql_file = Path(sql_path)
     sql_text = sql_file.read_text(encoding="utf-8-sig")
-    if sql_text.count("?") != 5:
-        raise ValueError(
-            "Plik SQL musi zawierać 5 placeholderów ?: validFrom, validTo, lead, owner i typ."
+    placeholder_count = sql_text.count("?")
+    if placeholder_count == 5:
+        params: list[object] | None = weather_query_parameters(
+            valid_from_cet=valid_from_cet,
+            valid_to_cet_exclusive=valid_to_cet_exclusive,
+            min_lead_hours=min_lead_hours,
+            owner=owner,
+            weather_type=weather_type,
         )
-    params = weather_query_parameters(
-        valid_from_cet=valid_from_cet,
-        valid_to_cet_exclusive=valid_to_cet_exclusive,
-        min_lead_hours=min_lead_hours,
-        owner=owner,
-        weather_type=weather_type,
-    )
+    elif placeholder_count == 0:
+        params = None
+        warnings.warn(
+            "Plik SQL nie ma placeholderów parametrów. Zostanie wykonany bez zmian; "
+            "zakres dat, punkty i historyczny vintage muszą być poprawnie ustawione "
+            "wewnątrz samej kwerendy.",
+            UserWarning,
+            stacklevel=2,
+        )
+    else:
+        raise ValueError(
+            f"Plik SQL zawiera {placeholder_count} placeholderów ?. Obsługiwane jest "
+            "dokładnie 5 (validFrom, validTo, lead, owner, typ) albo 0 dla zwykłego "
+            "SQL-a z własnymi DECLARE."
+        )
     connection = pyodbc.connect(
         settings.connection_string(),
         timeout=settings.connect_timeout_seconds,
@@ -129,7 +143,10 @@ def query_weather_sql(
     try:
         if query_timeout_seconds > 0:
             connection.timeout = int(query_timeout_seconds)
-        frame = pd.read_sql_query(sql_text, connection, params=params)
+        if params is None:
+            frame = pd.read_sql_query(sql_text, connection)
+        else:
+            frame = pd.read_sql_query(sql_text, connection, params=params)
     finally:
         connection.close()
     frame.columns = [str(column).strip() for column in frame.columns]

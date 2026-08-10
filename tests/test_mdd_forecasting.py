@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 from mdd_forecasting.cli import _infer_sql_date_range
-from mdd_forecasting.config import PipelineConfig
+from mdd_forecasting.config import PipelineConfig, WEATHER_FEATURES
 from mdd_forecasting.database import (
     SqlServerSettings,
     query_weather_sql,
@@ -25,7 +25,12 @@ from mdd_forecasting.io import (
 )
 from mdd_forecasting.model import run_forecasting
 from mdd_forecasting.report import write_results_workbook
-from uruchom_model import MODEL_BACKEND, MIN_LEAD_HOURS, build_cli_args
+from uruchom_model import (
+    MODEL_BACKEND,
+    MIN_LEAD_HOURS,
+    WEATHER_AVAILABLE_FROM,
+    build_cli_args,
+)
 
 
 class TestMddForecasting(unittest.TestCase):
@@ -38,6 +43,10 @@ class TestMddForecasting(unittest.TestCase):
         self.assertEqual(args[args.index("--model-backend") + 1], MODEL_BACKEND)
         self.assertEqual(
             args[args.index("--min-lead-hours") + 1], str(MIN_LEAD_HOURS)
+        )
+        self.assertEqual(
+            args[args.index("--weather-available-from") + 1],
+            WEATHER_AVAILABLE_FROM,
         )
         sql_path = Path(args[args.index("--weather-sql") + 1])
         self.assertTrue(sql_path.exists())
@@ -116,6 +125,40 @@ class TestMddForecasting(unittest.TestCase):
         self.assertEqual(len(params), 5)
         self.assertEqual(params[2:], [24, "PGESA", "Open Meteo"])
 
+    def test_plain_sql_without_placeholders_is_supported(self):
+        class FakeConnection:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        connection = FakeConnection()
+        fake_pyodbc = SimpleNamespace(
+            drivers=lambda: ["ODBC Driver 17 for SQL Server"],
+            connect=lambda *args, **kwargs: connection,
+        )
+        expected = pd.DataFrame({"punkt": ["Łódź"]})
+        with tempfile.TemporaryDirectory() as tmp:
+            sql_path = Path(tmp) / "firmowy.sql"
+            sql_path.write_text(
+                "DECLARE @data_start date = '2025-01-01'; SELECT 'Łódź' AS punkt;",
+                encoding="utf-8",
+            )
+            with patch.dict("sys.modules", {"pyodbc": fake_pyodbc}), patch(
+                "mdd_forecasting.database.pd.read_sql_query", return_value=expected
+            ) as read_query, self.assertWarnsRegex(UserWarning, "bez zmian"):
+                result = query_weather_sql(
+                    sql_path,
+                    settings=SqlServerSettings(),
+                    valid_from_cet="2025-01-01",
+                    valid_to_cet_exclusive="2025-01-03",
+                    min_lead_hours=24,
+                )
+        self.assertEqual(result.to_dict("records"), [{"punkt": "Łódź"}])
+        self.assertTrue(connection.closed)
+        self.assertNotIn("params", read_query.call_args.kwargs)
+
     def test_sql_range_is_inferred_from_energy_dates(self):
         energy = pd.DataFrame(
             {"doba_handlowa": ["2025-01-05", "2025-01-07", None]}
@@ -123,6 +166,26 @@ class TestMddForecasting(unittest.TestCase):
         valid_from, valid_to = _infer_sql_date_range(energy, None, None)
         self.assertEqual(valid_from, pd.Timestamp("2025-01-05"))
         self.assertEqual(valid_to, pd.Timestamp("2025-01-08"))
+
+    def test_sql_range_is_clamped_to_weather_start(self):
+        energy = pd.DataFrame(
+            {"doba_handlowa": ["2023-07-29", "2024-11-15", None]}
+        )
+        valid_from, valid_to = _infer_sql_date_range(
+            energy, None, None, "2024-10-01"
+        )
+        self.assertEqual(valid_from, pd.Timestamp("2024-10-01"))
+        self.assertEqual(valid_to, pd.Timestamp("2024-11-16"))
+
+    def test_sql_is_skipped_when_all_energy_is_before_weather_start(self):
+        energy = pd.DataFrame(
+            {"doba_handlowa": ["2023-07-29", "2024-09-30", None]}
+        )
+        valid_from, valid_to = _infer_sql_date_range(
+            energy, None, None, "2024-10-01"
+        )
+        self.assertIsNone(valid_from)
+        self.assertEqual(valid_to, pd.Timestamp("2024-10-01"))
 
     def test_weather_vintage_respects_minimum_lead(self):
         valid = pd.Timestamp("2025-01-03 12:00:00")
@@ -141,6 +204,45 @@ class TestMddForecasting(unittest.TestCase):
         self.assertEqual(len(selected), 1)
         self.assertEqual(float(selected.iloc[0]["temperatura"]), 1.0)
         self.assertEqual(float(selected.iloc[0]["weather_lead_hours"]), 30.0)
+
+    def test_weather_before_october_is_expected_and_nulls_are_preserved(self):
+        energy_raw = pd.DataFrame(
+            [
+                ["Dane_01", 2, "BIA", 1, "G", "K", "czynne pobranie", "2024-09-30", 4, 1, 10],
+                ["Dane_01", 3, "BIA", 1, "G", "K", "czynne pobranie", "2024-10-02", 4, 1, 11],
+                ["Dane_01", 4, "XYZ", 1, "G", "K", "czynne pobranie", "2024-09-30", 4, 1, 12],
+            ],
+            columns=[
+                "source_sheet", "source_row", "oddzial_code", "kierunek_code", "grupa",
+                "klient_nazwa", "kierunek_energii", "doba_handlowa", "rodzaj",
+                "godzina_handlowa", "wartosc_rzeczywista",
+            ],
+        )
+        energy, _ = normalize_energy(energy_raw, {"bia": "Białystok"})
+        valid = pd.Timestamp("2024-10-02 00:00:00")
+        weather_raw = pd.DataFrame(
+            {
+                "punkt": ["Białystok"],
+                "dataGodzinaCET": [valid],
+                "czasDanychZrodlaCET": [valid - pd.Timedelta(hours=30)],
+                "temperatura": [None],
+            }
+        )
+        weather = normalize_weather(weather_raw, PipelineConfig(min_lead_hours=24))
+        joined, quality = join_energy_weather(
+            energy, weather, weather_available_from="2024-10-01"
+        )
+
+        self.assertEqual(len(joined), 3)
+        self.assertEqual(joined.loc[0, "weather_status"], "PRZED_STARTEM_POGODY")
+        self.assertEqual(joined.loc[1, "weather_status"], "DOPASOWANA")
+        self.assertEqual(joined.loc[2, "weather_status"], "BRAK_MAPOWANIA")
+        self.assertEqual(float(joined.loc[1, "pogoda_dostepna"]), 1.0)
+        self.assertTrue(pd.isna(joined.loc[1, "temperatura"]))
+        self.assertEqual(int(joined.loc[1, "liczba_cech_pogodowych"]), 0)
+        quality_counts = quality.set_index("kontrola")["liczba"]
+        self.assertEqual(int(quality_counts["pogoda_przed_startem_zrodla"]), 1)
+        self.assertEqual(int(quality_counts["pogoda_rekord_bez_cech"]), 1)
 
     def test_end_to_end_demo_creates_oof_predictions(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -161,11 +263,24 @@ class TestMddForecasting(unittest.TestCase):
             self.assertTrue(joined["pogoda_dopasowana"].all())
             historical_gap_index = joined.index[100]
             joined.loc[historical_gap_index, "wartosc_rzeczywista"] = float("nan")
+            future_time = joined["model_timestamp_utc"].max()
+            future_rows = joined["model_timestamp_utc"].eq(future_time)
+            joined.loc[future_rows, "wartosc_rzeczywista"] = float("nan")
+            joined.loc[future_rows, "pogoda_dopasowana"] = False
+            joined.loc[future_rows, "pogoda_dostepna"] = 0.0
+            joined.loc[future_rows, "weather_status"] = "BRAK_POGODY_W_ZAKRESIE"
+            joined.loc[future_rows, WEATHER_FEATURES] = float("nan")
             result = run_forecasting(joined, config)
             evaluated = result.predictions["status_predykcji"].eq("OOF_BACKTEST")
             self.assertGreater(int(evaluated.sum()), 0)
             self.assertFalse(result.metrics.empty)
+            self.assertIn("POGODA", set(result.metrics["zakres"]))
             self.assertEqual(set(result.models), {"POBRANIE", "ODDANIE"})
+            future_predictions = result.predictions.loc[future_rows]
+            self.assertTrue(
+                future_predictions["status_predykcji"].eq("PROGNOZA_PRZYSZLA").all()
+            )
+            self.assertTrue(future_predictions["prognoza_bez_pogody"].all())
             self.assertEqual(
                 result.predictions.loc[historical_gap_index, "status_predykcji"],
                 "HISTORYCZNY_BRAK_TARGETU",

@@ -9,6 +9,8 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from .config import WEATHER_FEATURES
+
 
 EXCEL_MAX_ROWS = 1_048_576
 EXCEL_DATA_ROWS_PER_SHEET = EXCEL_MAX_ROWS - 1
@@ -181,6 +183,25 @@ def _summary_rows(
     )
     matched = predictions.get("pogoda_dopasowana", pd.Series(False, index=predictions.index))
     weather_share = float(pd.Series(matched).fillna(False).mean()) if len(predictions) else 0.0
+    weather_status = predictions.get(
+        "weather_status", pd.Series("BRAK_STATUSU", index=predictions.index)
+    ).astype("string")
+    post_start_scope = weather_status.isin(["DOPASOWANA", "BRAK_POGODY_W_ZAKRESIE"])
+    post_start_weather_share = (
+        float(weather_status.loc[post_start_scope].eq("DOPASOWANA").mean())
+        if post_start_scope.any()
+        else None
+    )
+    feature_count = pd.to_numeric(
+        predictions.get("liczba_cech_pogodowych", pd.Series(0, index=predictions.index)),
+        errors="coerce",
+    ).fillna(0)
+    partial_weather = pd.Series(matched, index=predictions.index).fillna(False) & feature_count.lt(
+        len(WEATHER_FEATURES)
+    )
+    future_without_weather = predictions.get(
+        "prognoza_bez_pogody", pd.Series(False, index=predictions.index)
+    )
 
     def metric(model: str, name: str) -> float | None:
         if metrics.empty:
@@ -207,7 +228,11 @@ def _summary_rows(
         ["Dane", "Wiersze z wykonaniem", int(actual.notna().sum()), "Target Wartość jest dostępny"],
         ["Ocena", "Predykcje OOF", int(status.eq("OOF_BACKTEST").sum()), "Tylko te wiersze służą do uczciwej oceny"],
         ["Prognoza", "Wiersze przyszłe", int(status.eq("PROGNOZA_PRZYSZLA").sum()), "Wiersze po ostatnim znanym wykonaniu"],
-        ["Jakość", "Dopasowanie pogody", weather_share, "Udział wierszy z pogodą"],
+        ["Prognoza", "Przyszłe bez pogody", int(pd.Series(future_without_weather).fillna(False).sum()), "Predykcja używa historii energii i kalendarza"],
+        ["Jakość", "Wiersze przed dostępnością pogody", int(weather_status.eq("PRZED_STARTEM_POGODY").sum()), "Oczekiwany brak przed 2024-10-01"],
+        ["Jakość", "Dopasowanie pogody po starcie", post_start_weather_share, "Dopasowane / (dopasowane + brak rekordu); bez błędnych kluczy i mapowania"],
+        ["Jakość", "Dopasowanie pogody — wszystkie wiersze", weather_share, "Wskaźnik pomocniczy obejmujący okres sprzed 2024-10-01"],
+        ["Jakość", "Dopasowane rekordy z NULL", int(partial_weather.sum()), "Co najmniej jedna z cech pogodowych jest pusta; wiersz pozostaje"],
         ["Model", "Wytrenowane kierunki", ", ".join(sorted(models)) or "brak", "Oddzielne modele pobrania i oddania"],
         ["Model", "MAE ML (OOF)", ml_mae, "Niżej = lepiej; jednostka taka jak Wartość"],
         ["Baseline", "MAE średniej D-3...D-14", baseline_mae, "Średnia analogicznej godziny z 3–14 dni wcześniej"],

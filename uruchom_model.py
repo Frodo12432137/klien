@@ -15,6 +15,7 @@ BASE_DIR = Path(__file__).resolve().parent
 SQL_PATH = BASE_DIR / "mdd_forecasting" / "sql" / "pogoda_mdd.sql"
 MODEL_BACKEND = "catboost"
 MIN_LEAD_HOURS = 24
+WEATHER_AVAILABLE_FROM = "2024-10-01"
 
 
 def build_cli_args(
@@ -22,6 +23,7 @@ def build_cli_args(
     output_dir: str | Path,
     model_backend: str = MODEL_BACKEND,
     min_lead_hours: int = MIN_LEAD_HOURS,
+    weather_available_from: str = WEATHER_AVAILABLE_FROM,
 ) -> list[str]:
     """Buduje przenośne argumenty bez prywatnych i służbowych ścieżek w kodzie."""
 
@@ -36,6 +38,8 @@ def build_cli_args(
         model_backend,
         "--min-lead-hours",
         str(int(min_lead_hours)),
+        "--weather-available-from",
+        str(weather_available_from),
     ]
 
 
@@ -95,7 +99,8 @@ def main() -> int:
             "Model pobierze pogodę z firmowego SQL Server i rozpocznie uczenie.\n\n"
             f"Dane energii:\n{energy}\n\n"
             f"Wyniki:\n{output}\n\n"
-            f"Model: {MODEL_BACKEND}\nMinimalny lead pogody: {MIN_LEAD_HOURS} h",
+            f"Model: {MODEL_BACKEND}\nMinimalny lead pogody: {MIN_LEAD_HOURS} h\n"
+            f"Początek danych pogodowych: {WEATHER_AVAILABLE_FROM}",
             parent=root,
         )
         if not confirmed:
@@ -118,11 +123,12 @@ def main() -> int:
                 parent=root,
             )
             return 1
-        except Exception:
+        except Exception as exc:
             log_path = _write_error_log(Path(output))
             messagebox.showerror(
                 "Model zakończył się błędem",
-                "Szczegóły zapisano w pliku:\n"
+                f"Przyczyna:\n{type(exc).__name__}: {exc}\n\n"
+                "Pełne szczegóły zapisano w pliku:\n"
                 f"{log_path}\n\nWyślij ten plik przy zgłaszaniu problemu.",
                 parent=root,
             )

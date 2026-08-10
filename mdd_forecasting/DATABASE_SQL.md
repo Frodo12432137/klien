@@ -54,11 +54,51 @@ Python przekazuje je przez `params=`, a nie przez `re.sub`. Daty są obiektami
 Zakres jest automatycznie wyznaczany z całego Excela:
 
 ```text
-validFromCET        = min(Doba Handlowa)
+validFromCET        = max(min(Doba Handlowa), 2024-10-01)
 validToCETExclusive = max(Doba Handlowa) + 1 dzień
 ```
 
-Można go nadpisać opcjami `--valid-from` i `--valid-to-exclusive`.
+Pogoda w źródle jest dostępna od **2024-10-01**, dlatego w trybie pięciu parametrów
+dolna granica jest clampowana do tej daty także wtedy, gdy Excel albo opcja
+`--valid-from` wskazuje wcześniejszy dzień. `--valid-to-exclusive` nadal określa
+górną granicę półotwartego zakresu.
+
+Clamp dotyczy wyłącznie zapytania pogodowego. Wiersze energii sprzed `2024-10-01`
+pozostają w danych jako historia klienta, źródło kalendarza oraz materiał do budowy
+lagów D-3...D-14.
+
+### Zwykły firmowy SQL bez `?`
+
+Program obsługuje również plik SQL, który nie ma żadnych placeholderów `?` i sam
+ustawia zmienne przez `DECLARE`, np. `@data_start` i `@data_stop`. Taki plik jest
+wykonywany dokładnie w zapisanej postaci. Wtedy program nie może automatycznie
+przekazać zakresu z Excela ani `minLeadHours`, dlatego kwerenda musi samodzielnie:
+
+- ustawić właściwy zakres dat;
+- ustawić dolną granicę pogody nie wcześniej niż `2024-10-01` (np. przez
+  `CASE`/`IF`, jeżeli własny `DECLARE @data_start` może wskazać wcześniejszy dzień);
+- zwrócić wymagane kolumny `punkt` i `dataGodzinaCET`;
+- najlepiej zwrócić również `czasDanychZrodlaCET/UTC`, aby Python mógł sprawdzić
+  historyczny vintage bez leakage.
+
+Obsługiwane są zatem dwa kontrakty: dokładnie **5** placeholderów dla wersji
+parametryzowanej albo dokładnie **0** dla samodzielnego zwykłego SQL-a. Inna liczba
+jest traktowana jako niekompletna kwerenda i kończy się czytelnym błędem.
+
+## Okres bez pogody i wartości NULL
+
+Brak pogody przed `2024-10-01` nie usuwa obserwacji energii. Lewostronne łączenie
+zachowuje każdy wiersz Excela, również gdy miasto i valid time nie mają rekordu
+pogodowego. Takie obserwacje nadal uczestniczą w historii klienta, cechach
+kalendarzowych i lagach D-3...D-14.
+
+Kolumn pogodowych z `NULL` nie zerujemy w przygotowanych danych ani raporcie.
+`NULL/NaN` oznacza brak dostępnej informacji, natomiast `0` może być prawdziwą
+temperaturą, brakiem opadu, brakiem wiatru albo promieniowaniem nocnym. CatBoost
+obsługuje brak natywnie; backend sklearn imputuje go dopiero wewnątrz pipeline'u i
+dodaje wskaźnik braku. Sam brak wartości pogodowej nie jest warunkiem odrzucenia
+wiersza; jego dopasowanie pozostaje widoczne w polach `pogoda_dopasowana`,
+`weather_status`, liczbie dostępnych cech oraz kontroli jakości.
 
 ## Co robi kwerenda
 
