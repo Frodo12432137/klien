@@ -16,8 +16,9 @@ SQL_PATH = BASE_DIR / "mdd_forecasting" / "sql" / "pogoda_mdd.sql"
 MODEL_BACKEND = "catboost"
 MIN_LEAD_HOURS = 24
 WEATHER_AVAILABLE_FROM = "2024-10-01"
-EXECUTION_PROFILE = "fast_30min"
-MAX_INPUT_ROWS = 150_000
+EXECUTION_PROFILE = "full_training"
+# None = cały Excel i wszystkie użyteczne wiersze historyczne.
+MAX_INPUT_ROWS = None
 INPUT_ROW_SELECTION = "tail"
 VALIDATION_DAYS = 7
 FOLDS = 1
@@ -25,7 +26,7 @@ CALIBRATION_DAYS = 7
 MIN_CALIBRATION_ROWS = 200
 MIN_BLEND_IMPROVEMENT = 0.02
 BLEND_GRID_STEPS = 21
-MAX_TRAIN_ROWS = 100_000
+MAX_TRAIN_ROWS = None
 MAX_ITER = 180
 CATBOOST_DEPTH = 6
 MAX_FIT_MINUTES = 3.0
@@ -43,7 +44,7 @@ def build_cli_args(
 ) -> list[str]:
     """Buduje przenośne argumenty bez prywatnych i służbowych ścieżek w kodzie."""
 
-    return [
+    args = [
         "--energy",
         str(Path(energy_path).expanduser().resolve()),
         "--weather-sql",
@@ -58,8 +59,6 @@ def build_cli_args(
         str(weather_available_from),
         "--execution-profile",
         EXECUTION_PROFILE,
-        "--max-input-rows",
-        str(MAX_INPUT_ROWS),
         "--input-row-selection",
         INPUT_ROW_SELECTION,
         "--validation-days",
@@ -74,8 +73,6 @@ def build_cli_args(
         str(MIN_BLEND_IMPROVEMENT),
         "--blend-grid-steps",
         str(BLEND_GRID_STEPS),
-        "--max-train-rows",
-        str(MAX_TRAIN_ROWS),
         "--max-iter",
         str(MAX_ITER),
         "--catboost-depth",
@@ -90,7 +87,14 @@ def build_cli_args(
         str(SQL_CONNECT_TIMEOUT_SECONDS),
         "--skip-importance",
         "--compact-output",
+        "--skip-full-history-score",
+        "--oof-output-only",
     ]
+    if MAX_INPUT_ROWS is not None:
+        args.extend(["--max-input-rows", str(MAX_INPUT_ROWS)])
+    if MAX_TRAIN_ROWS is not None:
+        args.extend(["--max-train-rows", str(MAX_TRAIN_ROWS)])
+    return args
 
 
 def _write_error_log(output_dir: Path) -> Path:
@@ -145,8 +149,12 @@ def main() -> int:
             return 1
 
         confirmed = messagebox.askokcancel(
-            "Uruchomić model MDD?",
-            "Model pobierze pogodę z firmowego SQL Server i rozpocznie uczenie.\n\n"
+            "Uruchomić pełne uczenie modelu MDD?",
+            "Tryb: PEŁNE UCZENIE MODELU\n\n"
+            "Program wczyta cały Excel — bez limitu 150 000 wierszy — oraz "
+            "wykorzysta wszystkie rekordy z dostępnym baseline D-3...D-14.\n"
+            "Wykona backtest, a potem nauczy końcowe modele POBRANIA i ODDANIA "
+            "na całej dostępnej historii.\n\n"
             f"Dane energii:\n{energy}\n\n"
             f"Wyniki:\n{output}\n\n"
             f"Model: {MODEL_BACKEND}\nMinimalny lead pogody: {MIN_LEAD_HOURS} h\n"
@@ -155,8 +163,11 @@ def main() -> int:
             "Korekta zostanie użyta tylko, jeśli kalibracja potwierdzi co najmniej "
             f"{MIN_BLEND_IMPROVEMENT:.0%} poprawy; inaczej działa bezpieczny fallback "
             "do średniej.\n\n"
-            "Profil szybki: najnowsze 150 000 wierszy, 1 backtest, "
-            "7 dni kalibracji, maks. 3 minuty na pojedynczy model.",
+            "Wynikiem będzie raport OOF oraz plik pakiet_modelu_mdd.joblib do "
+            "późniejszego programu predykcyjnego.\n\n"
+            "Uwaga: pełny zbiór może wymagać dużo pamięci i działać znacznie "
+            "dłużej niż profil szybki. Limit 3 minut dotyczy pojedynczego fitu "
+            "CatBoost, a nie odczytu Excela, SQL ani budowy cech.",
             parent=root,
         )
         if not confirmed:
@@ -192,8 +203,9 @@ def main() -> int:
 
         if exit_code == 0:
             open_folder = messagebox.askyesno(
-                "Gotowe",
+                "Pełne uczenie zakończone",
                 f"Model zakończył pracę.\n\nRaport:\n{Path(output) / 'wyniki_mdd.xlsx'}\n\n"
+                f"Pakiet do przyszłej predykcji:\n{Path(output) / 'pakiet_modelu_mdd.joblib'}\n\n"
                 "Czy otworzyć katalog wynikowy?",
                 parent=root,
             )

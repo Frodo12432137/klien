@@ -109,26 +109,26 @@ def add_lag_features(
         )["wartosc_rzeczywista"]
         .mean()
     )
+    history_indexed = history.set_index(
+        ["series_id", "doba_handlowa", "godzina_handlowa"]
+    )["wartosc_rzeczywista"]
     lag_features: list[str] = []
     for days in lag_days:
         hours = 24 * int(days)
         lag_name = f"lag_{hours}h"
         lag_features.append(lag_name)
-        lagged = history.rename(columns={"wartosc_rzeczywista": lag_name}).copy()
-        # Ten sam numer godziny handlowej sprzed D dni. Jest to odporniejsze na
-        # CET/CEST niż odejmowanie D * 24 godzin od naiwnego czasu lokalnego.
-        lagged["doba_handlowa"] = lagged["doba_handlowa"] + pd.to_timedelta(
-            int(days), unit="D"
+        # Reindex po kluczu jest znacznie oszczędniejszy pamięciowo niż 12 kolejnych
+        # merge całej, coraz szerszej ramki. Odejmujemy dni kalendarzowe, więc klucz
+        # godziny handlowej pozostaje odporny na przejścia CET/CEST.
+        lookup_keys = pd.MultiIndex.from_arrays(
+            [
+                df["series_id"],
+                df["doba_handlowa"] - pd.to_timedelta(int(days), unit="D"),
+                df["godzina_handlowa"],
+            ],
+            names=history_indexed.index.names,
         )
-        before = len(df)
-        df = df.merge(
-            lagged,
-            on=["series_id", "doba_handlowa", "godzina_handlowa"],
-            how="left",
-            validate="many_to_one",
-        )
-        if len(df) != before:
-            raise AssertionError(f"Lag {hours} h zmienił liczbę wierszy.")
+        df[lag_name] = history_indexed.reindex(lookup_keys).to_numpy(dtype=float)
 
     mean_feature = (
         LAG_MEAN_FEATURE

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import time
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from .artifacts import build_forecast_bundle
 from .config import DEFAULT_MAPPING_PATH, PipelineConfig, WEATHER_FEATURES
 from .database import (
     DEFAULT_SQL_DATABASE,
@@ -92,11 +94,16 @@ def _parser() -> argparse.ArgumentParser:
         help="Liczba sprawdzanych wartości alpha blendu w przedziale 0..1.",
     )
     parser.add_argument("--min-train-rows", type=int, default=200)
-    parser.add_argument("--max-train-rows", type=int, default=1_000_000)
+    parser.add_argument(
+        "--max-train-rows",
+        type=int,
+        default=None,
+        help="Opcjonalny limit treningu na kierunek; brak flagi = wszystkie wiersze.",
+    )
     parser.add_argument("--max-iter", type=int, default=220)
     parser.add_argument(
         "--execution-profile",
-        choices=["standard", "fast_30min"],
+        choices=["standard", "fast_30min", "full_training"],
         default="standard",
     )
     parser.add_argument(
@@ -118,6 +125,19 @@ def _parser() -> argparse.ArgumentParser:
         help="Limit czasu pojedynczego fitu CatBoost; sprawdzany po każdej iteracji.",
     )
     parser.add_argument("--model-progress-interval", type=int, default=0)
+    parser.add_argument(
+        "--skip-full-history-score",
+        action="store_true",
+        help=(
+            "Po treningu nie licz kosztownej predykcji in-sample całej historii; "
+            "OOF i przyszłość pozostają bez zmian."
+        ),
+    )
+    parser.add_argument(
+        "--oof-output-only",
+        action="store_true",
+        help="Eksportuj wiersze predykcji tylko dla OOF i przyszłości.",
+    )
     parser.add_argument("--skip-importance", action="store_true")
     parser.add_argument(
         "--compact-output",
@@ -242,10 +262,11 @@ def _validate_args(args: argparse.Namespace) -> None:
         "--calibration-days": args.calibration_days,
         "--min-calibration-rows": args.min_calibration_rows,
         "--min-train-rows": args.min_train_rows,
-        "--max-train-rows": args.max_train_rows,
         "--max-iter": args.max_iter,
         "--catboost-depth": args.catboost_depth,
     }
+    if args.max_train_rows is not None:
+        positive["--max-train-rows"] = args.max_train_rows
     if args.max_input_rows is not None:
         positive["--max-input-rows"] = args.max_input_rows
     if args.max_fit_minutes is not None:
@@ -253,7 +274,10 @@ def _validate_args(args: argparse.Namespace) -> None:
     invalid = [name for name, value in positive.items() if value <= 0]
     if invalid:
         raise ValueError(f"Parametry muszą być dodatnie: {', '.join(invalid)}")
-    if args.max_train_rows < args.min_train_rows:
+    if (
+        args.max_train_rows is not None
+        and args.max_train_rows < args.min_train_rows
+    ):
         raise ValueError("--max-train-rows nie może być mniejsze od --min-train-rows.")
     if args.sql_query_timeout < 0:
         raise ValueError("--sql-query-timeout nie może być ujemny.")
@@ -263,6 +287,16 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--min-blend-improvement musi należeć do przedziału [0, 1).")
     if args.blend_grid_steps < 2:
         raise ValueError("--blend-grid-steps musi wynosić co najmniej 2.")
+
+
+def _apply_execution_profile_defaults(args: argparse.Namespace) -> None:
+    """Nadaje realne limity profilowi szybkiemu, jeśli użytkownik ich nie podał."""
+
+    if args.execution_profile == "fast_30min":
+        if args.max_input_rows is None:
+            args.max_input_rows = 150_000
+        if args.max_train_rows is None:
+            args.max_train_rows = 100_000
 
 
 def _infer_sql_date_range(
@@ -302,6 +336,7 @@ def _infer_sql_date_range(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    _apply_execution_profile_defaults(args)
     _validate_args(args)
     run_started = time.monotonic()
 
@@ -335,13 +370,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
         model_progress_interval=args.model_progress_interval,
         compute_importance=not args.skip_importance,
+        score_full_history=not args.skip_full_history_score,
         mapping_path=Path(args.mapping),
         weather_already_vintaged=args.weather_already_vintaged,
     )
 
     source_info: dict[str, object]
     if args.weather:
-        progress("1/6 Czytam ograniczony zbiór energii i plik pogody...")
+        input_scope = (
+            f"maks. {args.max_input_rows:,} wierszy energii"
+            if args.max_input_rows is not None
+            else "cały zbiór energii"
+        )
+        progress(f"1/6 Czytam {input_scope} i plik pogody...")
         joined, quality, mapping = prepare_joined_dataset(
             args.energy,
             args.weather,
@@ -440,12 +481,18 @@ def main(argv: list[str] | None = None) -> int:
             "connection_string_from_env": bool(os.getenv("MDD_SQL_CONNECTION_STRING")),
             "weather_available_from": config.weather_available_from,
         }
+        # Po złączeniu pełnego zbioru surowe ramki tylko dublowałyby pamięć
+        # podczas budowy cech i uczenia.
+        del energy, weather_raw
+        gc.collect()
     source_info.update(
         {
             "execution_profile": config.execution_profile,
             "max_input_rows": args.max_input_rows,
             "input_row_selection": config.input_row_selection,
             "compact_output": bool(args.compact_output),
+            "oof_output_only": bool(args.oof_output_only),
+            "score_full_history": config.score_full_history,
         }
     )
     profile_quality = pd.DataFrame(
@@ -453,8 +500,13 @@ def main(argv: list[str] | None = None) -> int:
             ["profil_uruchomienia", len(joined), config.execution_profile],
             [
                 "limit_wierszy_wejscia",
-                args.max_input_rows or 0,
-                f"wybór={config.input_row_selection}; 0 oznacza brak limitu",
+                args.max_input_rows if args.max_input_rows is not None else "BRAK",
+                f"wybór={config.input_row_selection}; BRAK oznacza cały plik",
+            ],
+            [
+                "limit_wierszy_treningu_na_kierunek",
+                config.max_train_rows if config.max_train_rows is not None else "BRAK",
+                "BRAK oznacza wszystkie użyteczne wiersze historyczne",
             ],
             [
                 "limit_czasu_pojedynczego_fitu_sekundy",
@@ -468,6 +520,8 @@ def main(argv: list[str] | None = None) -> int:
 
     progress("4/6 Buduję cechy i uruchamiam uczenie...")
     result = run_forecasting(joined, config, progress_callback=progress)
+    del joined
+    gc.collect()
     progress("Uczenie i predykcja zakończone.")
     predictions = result.predictions
     hybrid_quality_rows: list[list[object]] = []
@@ -478,6 +532,8 @@ def main(argv: list[str] | None = None) -> int:
             # klasy HybridModelArtifact ani nie próbuje zgadywać parametrów.
             continue
         calibration_n = int(getattr(artifact, "calibration_n", 0) or 0)
+        train_rows = int(getattr(artifact, "train_rows", 0) or 0)
+        history_rows = int(getattr(artifact, "history_rows", 0) or 0)
         improvement = getattr(artifact, "calibration_improvement", None)
         reason = str(getattr(artifact, "calibration_reason", "BRAK_INFORMACJI"))
         target = str(getattr(artifact, "target", "residuum_wzgledem_D3_D14"))
@@ -495,7 +551,18 @@ def main(argv: list[str] | None = None) -> int:
                 (
                     f"alpha={float(alpha):.3f}; poprawa_MAE={improvement_text}; "
                     f"decyzja={reason}; target={target}; "
+                    f"wiersze_uczenia={train_rows}; historia={history_rows}; "
                     f"fit_zatrzymany_limitem={stopped_by_time}"
+                ),
+            ]
+        )
+        hybrid_quality_rows.append(
+            [
+                f"pelny_trening_{str(direction).lower()}",
+                train_rows,
+                (
+                    f"użyto {train_rows} z {history_rows} historycznych wierszy; "
+                    "pominięte rekordy nie miały naturalnego baseline D-3...D-14"
                 ),
             ]
         )
@@ -521,14 +588,29 @@ def main(argv: list[str] | None = None) -> int:
     )
     quality = pd.concat([quality, model_quality], ignore_index=True)
 
-    progress("5/6 Zapisuję kompaktowe CSV i modele...")
-    columns = _prediction_columns(predictions, compact=args.compact_output)
-    if predictions["source_sheet"].nunique(dropna=False) > 1:
-        for sheet_name, group in predictions.groupby("source_sheet", dropna=False, sort=False):
-            safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(sheet_name))
-            _write_csv(group[columns], output_dir / f"predykcje_{safe_name}.csv")
+    progress("5/6 Zapisuję wyniki i modele...")
+    if args.oof_output_only:
+        export_mask = predictions["status_predykcji"].isin(
+            ["OOF_BACKTEST", "PROGNOZA_PRZYSZLA"]
+        )
+        export_predictions = predictions.loc[export_mask].copy()
+        prediction_prefix = "predykcje_oof"
     else:
-        _write_csv(predictions[columns], output_dir / "predykcje.csv")
+        export_predictions = predictions
+        prediction_prefix = "predykcje"
+    columns = _prediction_columns(export_predictions, compact=args.compact_output)
+    if export_predictions["source_sheet"].nunique(dropna=False) > 1:
+        for sheet_name, group in export_predictions.groupby(
+            "source_sheet", dropna=False, sort=False
+        ):
+            safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(sheet_name))
+            _write_csv(
+                group[columns], output_dir / f"{prediction_prefix}_{safe_name}.csv"
+            )
+    else:
+        _write_csv(
+            export_predictions[columns], output_dir / f"{prediction_prefix}.csv"
+        )
     _write_csv(result.metrics, output_dir / "metryki.csv")
     _write_csv(result.feature_importance, output_dir / "waznosc_cech.csv")
     _write_csv(quality, output_dir / "kontrola_jakosci.csv")
@@ -540,6 +622,28 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("Brak joblib, mimo zainstalowanego scikit-learn.") from exc
     for direction, model in result.models.items():
         joblib.dump(model, output_dir / f"model_{direction.lower()}.joblib")
+    bundle = build_forecast_bundle(result, config, mapping)
+    bundle_path = output_dir / "pakiet_modelu_mdd.joblib"
+    joblib.dump(bundle, bundle_path)
+    if args.oof_output_only:
+        summary_columns = [
+            "status_predykcji",
+            "wartosc_rzeczywista",
+            "pogoda_dopasowana",
+            "weather_status",
+            "liczba_cech_pogodowych",
+            "prognoza_bez_pogody",
+        ]
+        summary_predictions_for_report = predictions.loc[
+            :, [column for column in summary_columns if column in predictions.columns]
+        ].copy()
+        # Bundle i statystyki są już zbudowane. Przed zapisem Excela zwalniamy
+        # szeroką macierz pełnej historii, zostawiając OOF oraz wąskie podsumowanie.
+        result.predictions = export_predictions
+        del predictions
+        gc.collect()
+    else:
+        summary_predictions_for_report = predictions
 
     config_payload = asdict(config)
     config_payload["mapping_path"] = str(config.mapping_path)
@@ -548,12 +652,24 @@ def main(argv: list[str] | None = None) -> int:
         "source": source_info,
         "categorical_features": result.feature_spec.categorical,
         "numeric_features": result.feature_spec.numeric,
+        "model_bundle": {
+            "filename": bundle_path.name,
+            "schema_version": bundle.schema_version,
+            "training_cutoff_utc": bundle.training_cutoff_utc,
+            "metadata": bundle.metadata,
+        },
         "note": (
             "Metryki HYBRYDA_OOF wykorzystują wyłącznie predykcje poza próbą. "
             "Korekta residualna jest dodawana do baseline D-3...D-14 tylko po "
             "potwierdzeniu minimalnej poprawy na kalibracji; w przeciwnym razie "
-            "alpha=0 oznacza bezpieczny fallback do baseline. Kolumna "
-            "wartosc_model_pelny dla historii jest in-sample i nie służy do oceny."
+            "alpha=0 oznacza bezpieczny fallback do baseline. Końcowe artefakty "
+            "uczą się ponownie na wszystkich użytecznych wierszach historii. "
+            "Współczynnik alpha zapisanego modelu końcowego jest wybierany na "
+            "historycznych wierszach OOF, natomiast raportowane metryki OOF "
+            "używają alpha "
+            "kalibrowanego wyłącznie przed każdym ocenianym oknem. "
+            "Jeżeli kolumna wartosc_model_pelny została wyliczona dla historii, "
+            "jest in-sample i nie służy do oceny."
         ),
     }
     (output_dir / "manifest.json").write_text(
@@ -561,7 +677,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     progress("6/6 Tworzę raport Excel...")
     workbook_path = write_results_workbook(
-        predictions=predictions,
+        predictions=export_predictions,
+        summary_predictions=summary_predictions_for_report,
         prediction_columns=columns,
         metrics=result.metrics,
         feature_importance=result.feature_importance,

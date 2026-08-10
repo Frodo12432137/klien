@@ -265,6 +265,7 @@ def write_results_workbook(
     models: Iterable[str],
     manifest: dict[str, object],
     output_path: str | Path,
+    summary_predictions: pd.DataFrame | None = None,
 ) -> Path:
     """Zapisuje jeden audytowalny XLSX; duże predykcje dzieli na arkusze."""
 
@@ -323,8 +324,11 @@ def write_results_workbook(
     }
 
     used_names: set[str] = set()
+    summary_source = (
+        predictions if summary_predictions is None else summary_predictions
+    )
     summary = pd.DataFrame(
-        _summary_rows(predictions, metrics, models),
+        _summary_rows(summary_source, metrics, models),
         columns=["sekcja", "wskaznik", "wartosc", "opis"],
     )
     _write_frame(

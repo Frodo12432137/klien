@@ -9,7 +9,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from mdd_forecasting.artifacts import (
+    BUNDLE_SCHEMA_VERSION,
+    ForecastBundle,
+    build_forecast_bundle,
+    load_forecast_bundle,
+)
 from mdd_forecasting.cli import (
+    _apply_execution_profile_defaults,
     _infer_sql_date_range,
     _parser,
     _prediction_columns,
@@ -31,9 +38,11 @@ from mdd_forecasting.io import (
     read_energy_file,
 )
 from mdd_forecasting.model import (
+    ForecastResult,
     HybridModelArtifact,
     _baseline_for_fold,
     _blend_prediction,
+    _cap_training,
     _CatBoostTimeLimit,
     _fit_residual_model,
     _select_blend_alpha,
@@ -49,9 +58,7 @@ from uruchom_model import (
     FOLDS,
     INPUT_ROW_SELECTION,
     MAX_FIT_MINUTES,
-    MAX_INPUT_ROWS,
     MAX_ITER,
-    MAX_TRAIN_ROWS,
     MIN_BLEND_IMPROVEMENT,
     MIN_CALIBRATION_ROWS,
     MODEL_BACKEND,
@@ -66,7 +73,7 @@ from uruchom_model import (
 
 
 class TestMddForecasting(unittest.TestCase):
-    def test_click_launcher_builds_portable_arguments(self):
+    def test_click_launcher_builds_full_dataset_arguments_without_row_limits(self):
         with tempfile.TemporaryDirectory() as tmp:
             args = build_cli_args(
                 Path(tmp) / "energia.xlsx",
@@ -82,7 +89,6 @@ class TestMddForecasting(unittest.TestCase):
         )
         expected_options = {
             "--execution-profile": EXECUTION_PROFILE,
-            "--max-input-rows": str(MAX_INPUT_ROWS),
             "--input-row-selection": INPUT_ROW_SELECTION,
             "--validation-days": str(VALIDATION_DAYS),
             "--folds": str(FOLDS),
@@ -90,7 +96,6 @@ class TestMddForecasting(unittest.TestCase):
             "--min-calibration-rows": str(MIN_CALIBRATION_ROWS),
             "--min-blend-improvement": str(MIN_BLEND_IMPROVEMENT),
             "--blend-grid-steps": str(BLEND_GRID_STEPS),
-            "--max-train-rows": str(MAX_TRAIN_ROWS),
             "--max-iter": str(MAX_ITER),
             "--catboost-depth": str(CATBOOST_DEPTH),
             "--max-fit-minutes": str(MAX_FIT_MINUTES),
@@ -102,9 +107,47 @@ class TestMddForecasting(unittest.TestCase):
             self.assertEqual(args[args.index(option) + 1], expected)
         self.assertIn("--skip-importance", args)
         self.assertIn("--compact-output", args)
+        self.assertNotIn("--max-input-rows", args)
+        self.assertNotIn("--max-train-rows", args)
         sql_path = Path(args[args.index("--weather-sql") + 1])
         self.assertTrue(sql_path.exists())
         self.assertNotIn("10200871", " ".join(args))
+
+    def test_cli_defaults_to_unlimited_input_and_training_rows(self):
+        args = _parser().parse_args(
+            [
+                "--energy",
+                "energia.xlsx",
+                "--weather",
+                "pogoda.csv",
+                "--output-dir",
+                "wyniki",
+            ]
+        )
+
+        self.assertIsNone(args.max_input_rows)
+        self.assertIsNone(args.max_train_rows)
+        _validate_args(args)
+
+    def test_fast_cli_profile_applies_real_row_limits(self):
+        args = _parser().parse_args(
+            [
+                "--energy",
+                "energia.xlsx",
+                "--weather",
+                "pogoda.csv",
+                "--output-dir",
+                "wyniki",
+                "--execution-profile",
+                "fast_30min",
+            ]
+        )
+
+        _apply_execution_profile_defaults(args)
+
+        self.assertEqual(args.max_input_rows, 150_000)
+        self.assertEqual(args.max_train_rows, 100_000)
+        _validate_args(args)
 
     def test_fast_profile_rejects_invalid_limits(self):
         args = _parser().parse_args(
@@ -167,6 +210,26 @@ class TestMddForecasting(unittest.TestCase):
             self.assertEqual(
                 int(selected.attrs["source_rows_total_estimate"]), 7
             )
+
+    def test_cap_training_none_preserves_all_rows_index_and_order(self):
+        frame = pd.DataFrame(
+            {
+                "model_timestamp_utc": pd.to_datetime(
+                    [
+                        "2025-01-03 00:00:00+00:00",
+                        "2025-01-01 00:00:00+00:00",
+                        "2025-01-02 00:00:00+00:00",
+                    ],
+                    utc=True,
+                ),
+                "wartosc_rzeczywista": [30.0, 10.0, 20.0],
+            },
+            index=[8, 2, 5],
+        )
+
+        uncapped = _cap_training(frame, None)
+
+        pd.testing.assert_frame_equal(uncapped, frame)
 
     def test_lag_window_uses_same_hour_from_day_3_to_day_14(self):
         dates = pd.date_range("2025-01-01", periods=15, freq="D")
@@ -496,6 +559,129 @@ class TestMddForecasting(unittest.TestCase):
         self.assertTrue(original_alphas.gt(0.0).all())
         pd.testing.assert_series_equal(original_alphas, modified_alphas)
 
+    def test_forecast_bundle_joblib_roundtrip_preserves_minimal_contract(self):
+        timestamps = pd.to_datetime(
+            [
+                "2025-01-01 07:00:00+00:00",
+                "2025-01-01 08:00:00+00:00",
+                "2025-01-22 07:00:00+00:00",
+                "2025-01-22 08:00:00+00:00",
+            ],
+            utc=True,
+        )
+        predictions = pd.DataFrame(
+            {
+                "oddzial_code": ["ŁZE", "ŁZE", "LUB", "LUB"],
+                "punkt": ["Łódź", "Łódź", "Lublin", "Lublin"],
+                "grupa": ["G", "G", "G", "G"],
+                "klient_nazwa": ["Klient Ł", "Klient Ł", "Klient L", "Klient L"],
+                "kierunek_energii_norm": [
+                    "POBRANIE",
+                    "ODDANIE",
+                    "POBRANIE",
+                    "ODDANIE",
+                ],
+                "rodzaj": [4, 4, 4, 4],
+                "doba_handlowa": pd.to_datetime(
+                    ["2025-01-01", "2025-01-01", "2025-01-22", "2025-01-22"]
+                ),
+                "godzina_handlowa": [8, 9, 8, 9],
+                "godzina": [7, 8, 7, 8],
+                "valid_timestamp": timestamps.tz_convert("Europe/Warsaw").tz_localize(None),
+                "model_timestamp_utc": timestamps,
+                "wartosc_rzeczywista": [100.0, 20.0, 110.0, 25.0],
+            }
+        )
+        feature_spec = FeatureSpec(
+            categorical=["klient_nazwa", "kierunek_energii_norm"],
+            numeric=["godzina"],
+        )
+        config = PipelineConfig(max_train_rows=None, compute_importance=False)
+        models = {
+            "POBRANIE": HybridModelArtifact(
+                estimator=None,
+                alpha=0.0,
+                calibration_n=20,
+                calibration_improvement=0.03,
+                calibration_reason="HYBRYDA_WYBRANA",
+                train_rows=2,
+                history_rows=2,
+            ),
+            "ODDANIE": HybridModelArtifact(
+                estimator=None,
+                alpha=0.0,
+                calibration_n=20,
+                calibration_improvement=0.0,
+                calibration_reason="BRAK_POTWIERDZONEJ_POPRAWY",
+                train_rows=2,
+                history_rows=2,
+            ),
+        }
+        metrics = pd.DataFrame(
+            {
+                "model": ["HYBRYDA_OOF"],
+                "zakres": ["GLOBAL"],
+                "wartosc_zakresu": ["ALL"],
+                "n": [4],
+                "mae": [1.5],
+            }
+        )
+        result = ForecastResult(
+            predictions=predictions,
+            metrics=metrics,
+            feature_importance=pd.DataFrame(),
+            models=models,
+            feature_spec=feature_spec,
+        )
+        mapping = pd.DataFrame(
+            {
+                "oddzial_code": ["ŁZE", "LUB"],
+                "punkt": ["Łódź", "Lublin"],
+                "status": ["active", "active"],
+            }
+        )
+
+        bundle = build_forecast_bundle(result, config, mapping)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pakiet_modelu_mdd.joblib"
+            import joblib
+
+            joblib.dump(bundle, path)
+            loaded = load_forecast_bundle(path)
+
+        self.assertIsInstance(loaded, ForecastBundle)
+        self.assertEqual(loaded.schema_version, BUNDLE_SCHEMA_VERSION)
+        self.assertEqual(set(loaded.models), {"POBRANIE", "ODDANIE"})
+        self.assertEqual(loaded.models["POBRANIE"].train_rows, 2)
+        self.assertEqual(loaded.models["POBRANIE"].history_rows, 2)
+        self.assertEqual(loaded.feature_spec, feature_spec)
+        self.assertEqual(loaded.config, config)
+        self.assertIsNone(loaded.config.max_train_rows)
+        self.assertTrue(
+            {
+                "klient_nazwa",
+                "kierunek_energii_norm",
+                "model_timestamp_utc",
+                "wartosc_rzeczywista",
+            }.issubset(loaded.history_tail.columns)
+        )
+        self.assertFalse(loaded.history_tail.empty)
+        self.assertEqual(
+            set(loaded.fallback_profiles),
+            {
+                "klient_kierunek_godzina",
+                "oddzial_kierunek_godzina",
+                "kierunek_godzina",
+                "kierunek",
+                "globalna_mediana",
+            },
+        )
+        pd.testing.assert_frame_equal(loaded.history_tail, bundle.history_tail)
+        pd.testing.assert_frame_equal(loaded.branch_mapping, mapping)
+        pd.testing.assert_frame_equal(loaded.oof_metrics, metrics)
+        self.assertEqual(loaded.metadata["input_rows"], 4)
+        self.assertEqual(loaded.metadata["actual_rows"], 4)
+
     def test_sql_parameters_and_integrated_connection(self):
         params = weather_query_parameters("2025-01-01", "2025-02-01", 24)
         self.assertEqual(len(params), 5)
@@ -676,6 +862,7 @@ class TestMddForecasting(unittest.TestCase):
                 max_train_rows=50_000,
                 max_iter=35,
                 compute_importance=False,
+                score_full_history=False,
             )
             joined, quality, _ = prepare_joined_dataset(
                 energy_path, weather_path, config=config
@@ -715,6 +902,20 @@ class TestMddForecasting(unittest.TestCase):
                     for artifact in result.models.values()
                 )
             )
+            for direction, artifact in result.models.items():
+                history_mask = (
+                    result.predictions["kierunek_energii_norm"].eq(direction)
+                    & result.predictions["wartosc_rzeczywista"].notna()
+                    & result.predictions["wartosc_rzeczywista"].ge(0)
+                    & result.predictions["model_timestamp_utc"].notna()
+                )
+                usable_train_mask = history_mask & result.predictions[
+                    "wartosc_bazowa"
+                ].notna()
+                self.assertEqual(artifact.history_rows, int(history_mask.sum()))
+                self.assertEqual(artifact.train_rows, int(usable_train_mask.sum()))
+                self.assertGreater(artifact.train_rows, 0)
+                self.assertGreaterEqual(artifact.history_rows, artifact.train_rows)
             self.assertTrue(
                 all(0.0 <= artifact.alpha <= 1.0 for artifact in result.models.values())
             )
@@ -748,6 +949,17 @@ class TestMddForecasting(unittest.TestCase):
             self.assertTrue(future_predictions["prognoza_bez_pogody"].all())
             self.assertTrue(future_predictions["blend_alpha"].between(0.0, 1.0).all())
             self.assertTrue(future_predictions["strategia_predykcji"].notna().all())
+            historical_actual = result.predictions["wartosc_rzeczywista"].notna()
+            self.assertTrue(
+                result.predictions.loc[
+                    historical_actual, "wartosc_model_pelny"
+                ].isna().all()
+            )
+            self.assertFalse(
+                result.predictions.loc[
+                    historical_actual, "model_pelny_jest_insample"
+                ].any()
+            )
             self.assertEqual(
                 result.predictions.loc[historical_gap_index, "status_predykcji"],
                 "HISTORYCZNY_BRAK_TARGETU",
