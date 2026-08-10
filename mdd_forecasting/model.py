@@ -190,10 +190,13 @@ def _metric_row(actual: pd.Series, predicted: pd.Series) -> dict[str, float]:
 def _metrics_by_scope(frame: pd.DataFrame, prediction_col: str, model_name: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     scopes: list[tuple[str, str, pd.DataFrame]] = [("GLOBAL", "ALL", frame)]
-    for scope_name, column in [
+    scope_columns = [
         ("KIERUNEK", "kierunek_energii_norm"),
         ("MIASTO", "punkt"),
-    ]:
+    ]
+    if "weather_status" in frame.columns:
+        scope_columns.append(("POGODA", "weather_status"))
+    for scope_name, column in scope_columns:
         for value, group in frame.groupby(column, dropna=False):
             scopes.append((scope_name, str(value), group))
     for scope_name, scope_value, group in scopes:
@@ -270,6 +273,7 @@ def run_forecasting(frame: pd.DataFrame, config: PipelineConfig) -> ForecastResu
     df["wartosc_przewidywana"] = np.nan
     df["wartosc_bazowa_backtest"] = np.nan
     df["wartosc_model_pelny"] = np.nan
+    df["prognoza_bez_pogody"] = False
     df["fold"] = pd.Series(pd.NA, index=df.index, dtype="Int64")
     df["status_predykcji"] = "WARMUP_BEZ_OOF"
     df.loc[historical_gap_mask, "status_predykcji"] = "HISTORYCZNY_BRAK_TARGETU"
@@ -359,6 +363,12 @@ def run_forecasting(frame: pd.DataFrame, config: PipelineConfig) -> ForecastResu
                 future_index, "wartosc_model_pelny"
             ]
             df.loc[future_index, "status_predykcji"] = "PROGNOZA_PRZYSZLA"
+            matched_weather = df.get(
+                "pogoda_dopasowana", pd.Series(False, index=df.index)
+            ).fillna(False)
+            df.loc[future_index, "prognoza_bez_pogody"] = ~matched_weather.loc[
+                future_index
+            ].astype(bool)
 
     evaluated = df[df["status_predykcji"].eq("OOF_BACKTEST")].copy()
     metric_rows: list[dict[str, Any]] = []

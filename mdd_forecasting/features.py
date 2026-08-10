@@ -147,6 +147,12 @@ def build_features(
     lag_days: tuple[int, ...] = DEFAULT_LAG_DAYS,
 ) -> tuple[pd.DataFrame, FeatureSpec]:
     df = add_lag_features(frame, lag_days=lag_days)
+    if "pogoda_dostepna" not in df.columns:
+        matched = df.get("pogoda_dopasowana", pd.Series(False, index=df.index))
+        df["pogoda_dostepna"] = pd.Series(matched, index=df.index).fillna(False)
+    df["pogoda_dostepna"] = pd.to_numeric(
+        df["pogoda_dostepna"], errors="coerce"
+    ).fillna(0.0).astype("float64")
     ts = pd.to_datetime(df["valid_timestamp"], errors="coerce")
     df["godzina"] = ts.dt.hour
     df["dzien_tygodnia"] = ts.dt.dayofweek
@@ -171,12 +177,21 @@ def build_features(
         dst_days.add(_last_sunday(year, 10))
     df["dzien_zmiany_czasu"] = dates.isin(dst_days).astype(float)
 
-    temperature = pd.to_numeric(df["temperatura"], errors="coerce")
-    wind_speed = pd.to_numeric(df["predkosc_wiatru"], errors="coerce")
-    wind_direction = pd.to_numeric(df["kierunek_wiatru"], errors="coerce")
-    cloud = pd.to_numeric(df["zachmurzenie"], errors="coerce")
-    radiation = pd.to_numeric(df["promieniowanie_calkowite"], errors="coerce")
-    precipitation = pd.to_numeric(df["opad_konwekcyjny"], errors="coerce")
+    # `Float64` z pandas przechowuje pd.NA; NumPy nie umie użyć takiej wartości jako
+    # warunku w np.where. Zwykłe float64 zachowuje brak jako np.nan i działa w obu
+    # backendach modelu.
+    temperature = pd.to_numeric(df["temperatura"], errors="coerce").astype("float64")
+    wind_speed = pd.to_numeric(df["predkosc_wiatru"], errors="coerce").astype("float64")
+    wind_direction = pd.to_numeric(df["kierunek_wiatru"], errors="coerce").astype(
+        "float64"
+    )
+    cloud = pd.to_numeric(df["zachmurzenie"], errors="coerce").astype("float64")
+    radiation = pd.to_numeric(
+        df["promieniowanie_calkowite"], errors="coerce"
+    ).astype("float64")
+    precipitation = pd.to_numeric(df["opad_konwekcyjny"], errors="coerce").astype(
+        "float64"
+    )
 
     df["stopniogodziny_grzania"] = (18.0 - temperature).clip(lower=0)
     df["stopniogodziny_chlodzenia"] = (temperature - 22.0).clip(lower=0)
@@ -202,6 +217,7 @@ def build_features(
 
     numeric = [
         *WEATHER_FEATURES,
+        "pogoda_dostepna",
         "weather_lead_hours",
         "godzina",
         "dzien_tygodnia",

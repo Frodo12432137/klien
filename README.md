@@ -76,6 +76,18 @@ przeciek informacji z późniejszych aktualizacji pogody.
 
 Gotowy ekstrakt jest w `sql/pogoda_mdd.sql`.
 
+Prognoza pogody w źródle jest dostępna od **2024-10-01**. Ta granica ogranicza
+wyłącznie zakres pobierania pogody: starsze wiersze Excela pozostają w zbiorze jako
+historia klienta, źródło cech kalendarzowych oraz danych do lagów D-3...D-14. Nie
+wolno ich usuwać tylko dlatego, że nie mają dopasowanej pogody.
+
+Brakujące wartości pogodowe pozostają w przygotowanych danych i raporcie jako
+`NULL/NaN`. Nie są tam zamieniane na zero, bo zero jest prawidłową wartością części
+parametrów (np. opadu lub promieniowania nocą) i oznacza coś innego niż brak
+pomiaru/prognozy. CatBoost obsługuje te braki natywnie; awaryjny backend sklearn
+imputuje je dopiero wewnątrz pipeline'u wraz z osobną flagą braku. Sam `NULL` pogodowy
+nie jest powodem usunięcia wiersza energii.
+
 ## Zmienne modelu
 
 ### Historia energii
@@ -178,16 +190,23 @@ Raportowane metryki:
 - `WAPE` i `sMAPE` — porównanie klientów o różnej skali bez klasycznego problemu
   MAPE przy zerach.
 
-Metryki są liczone globalnie, według kierunku, miasta oraz jako średnia makro po
-klientach. Ważność cech jest mierzona permutacyjnie na danych testowych, osobno dla
-pobrania i oddania.
+Metryki są liczone globalnie, według kierunku, miasta, statusu dostępności pogody oraz
+jako średnia makro po klientach. Porównanie błędów „z pogodą / bez pogody” jest
+diagnostyką zakresów, a nie dowodem przyczynowego wpływu pogody, bo okresy mogą różnić
+się sezonem i składem klientów. Wpływ samych cech pogodowych należy później potwierdzić
+testem ablation na identycznych wierszach. Ważność cech jest mierzona permutacyjnie na
+danych testowych, osobno dla pobrania i oddania.
 
 ## Uruchomienie bezpośrednio z SQL Server
 
 Domyślny tryb odpowiada konfiguracji ze zdjęcia: serwer
 `MISDWHPRD.GKPGE.PL`, baza `PGESA_MarketAnalytics`, sterownik ODBC 17 i
 `Trusted_Connection=yes`. Zakres zapytania jest wyliczany z min/max `Doby Handlowej`
-w Excelu.
+w Excelu. Dla parametryzowanego SQL-a z pięcioma placeholderami dolna granica
+pobierania pogody jest automatycznie clampowana do `2024-10-01`, czyli wynosi
+`max(min(Doba Handlowa), 2024-10-01)`. Nie skraca to historii energii w modelu.
+Zwykły firmowy SQL bez `?` nie otrzymuje parametrów od Pythona i musi sam ustawić
+dolną granicę co najmniej na `2024-10-01`.
 
 ```powershell
 python -m pip install -r mdd_forecasting\requirements-production.txt

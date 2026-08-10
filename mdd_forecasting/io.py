@@ -320,7 +320,10 @@ def normalize_weather(weather: pd.DataFrame, config: PipelineConfig) -> pd.DataF
 
 
 def join_energy_weather(
-    energy: pd.DataFrame, weather: pd.DataFrame, timezone: str = "Europe/Warsaw"
+    energy: pd.DataFrame,
+    weather: pd.DataFrame,
+    timezone: str = "Europe/Warsaw",
+    weather_available_from: str | pd.Timestamp | None = "2024-10-01",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     before = len(energy)
     use_trade_key = (
@@ -375,12 +378,80 @@ def join_energy_weather(
         )
         joined.loc[missing_utc, "model_timestamp_utc"] = localized
     joined["pogoda_dopasowana"] = joined["_weather_row_id"].notna()
-    quality = pd.DataFrame(
+    # Flaga numeryczna trafia do modelu. Brak prognozy nie jest zerem parametrów
+    # pogodowych: same cechy pozostają NaN, a flaga pozwala modelowi rozpoznać brak.
+    joined["pogoda_dostepna"] = joined["pogoda_dopasowana"].astype(float)
+    joined["liczba_cech_pogodowych"] = joined[WEATHER_FEATURES].notna().sum(axis=1)
+
+    trade_date = pd.to_datetime(joined["doba_handlowa"], errors="coerce").dt.normalize()
+    available_from = (
+        pd.Timestamp(weather_available_from).normalize()
+        if weather_available_from is not None
+        else None
+    )
+    joined["weather_status"] = "BRAK_POGODY_W_ZAKRESIE"
+    joined.loc[joined["pogoda_dopasowana"], "weather_status"] = "DOPASOWANA"
+    if available_from is not None:
+        joined.loc[trade_date.lt(available_from), "weather_status"] = (
+            "PRZED_STARTEM_POGODY"
+        )
+    # Błędy klucza i mapowania mają pierwszeństwo przed oczekiwanym brakiem pogody,
+    # aby nie ukrywać wad wejścia pod etykietą okresu sprzed 2024-10-01.
+    joined.loc[joined["model_timestamp_utc"].isna(), "weather_status"] = (
+        "BRAK_KLUCZA_CZASU"
+    )
+    joined.loc[joined["punkt"].isna(), "weather_status"] = "BRAK_MAPOWANIA"
+
+    matched_mask = joined["pogoda_dopasowana"]
+    quality_rows: list[list[object]] = [
+        ["tryb_laczenia", before, join_mode],
+        ["pogoda_dopasowana", int(joined["pogoda_dopasowana"].sum()), ""],
         [
-            ["tryb_laczenia", before, join_mode],
-            ["pogoda_dopasowana", int(joined["pogoda_dopasowana"].sum()), ""],
-            ["pogoda_niedopasowana", int((~joined["pogoda_dopasowana"]).sum()), ""],
+            "pogoda_przed_startem_zrodla",
+            int(joined["weather_status"].eq("PRZED_STARTEM_POGODY").sum()),
+            str(available_from.date()) if available_from is not None else "brak granicy",
         ],
+        [
+            "pogoda_brak_po_starcie",
+            int(joined["weather_status"].eq("BRAK_POGODY_W_ZAKRESIE").sum()),
+            "brak rekordu dla poprawnego miasta i czasu",
+        ],
+        [
+            "pogoda_brak_mapowania",
+            int(joined["weather_status"].eq("BRAK_MAPOWANIA").sum()),
+            "brak punktu pogodowego dla kodu oddziału",
+        ],
+        [
+            "pogoda_brak_klucza_czasu",
+            int(joined["weather_status"].eq("BRAK_KLUCZA_CZASU").sum()),
+            "niepoprawna/niejednoznaczna data lub godzina",
+        ],
+        [
+            "pogoda_rekord_czesciowy",
+            int(
+                (
+                    matched_mask
+                    & joined["liczba_cech_pogodowych"].lt(len(WEATHER_FEATURES))
+                ).sum()
+            ),
+            "rekord dopasowany, ale co najmniej jedna cecha ma NULL",
+        ],
+        [
+            "pogoda_rekord_bez_cech",
+            int((matched_mask & joined["liczba_cech_pogodowych"].eq(0)).sum()),
+            "rekord czasu/miasta istnieje, wszystkie cechy pogodowe mają NULL",
+        ],
+    ]
+    for feature in WEATHER_FEATURES:
+        quality_rows.append(
+            [
+                f"pogoda_null_{feature}",
+                int((matched_mask & joined[feature].isna()).sum()),
+                "NULL zachowany; wiersz nie jest usuwany ani zerowany",
+            ]
+        )
+    quality = pd.DataFrame(
+        quality_rows,
         columns=["kontrola", "liczba", "szczegoly"],
     )
     return joined, quality
@@ -427,6 +498,11 @@ def join_prepared_energy_with_weather(
     """Łączy wcześniej przygotowaną energię z pogodą pobraną z pliku albo SQL."""
 
     weather = normalize_weather(weather_raw, config)
-    joined, join_quality = join_energy_weather(energy, weather, timezone=config.timezone)
+    joined, join_quality = join_energy_weather(
+        energy,
+        weather,
+        timezone=config.timezone,
+        weather_available_from=config.weather_available_from,
+    )
     quality = pd.concat([energy_quality, join_quality], ignore_index=True)
     return joined, quality, mapping_df
