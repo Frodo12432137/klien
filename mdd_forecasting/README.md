@@ -1,4 +1,4 @@
-# Szybki model MDD: pobranie i oddanie energii
+# Model MDD: pobranie i oddanie energii
 
 To jest działające MVP, które łączy każdy wiersz danych energii z właściwą godzinową
 prognozą pogody, wykonuje chronologiczny backtest i uczy dwa modele:
@@ -24,16 +24,43 @@ Na komputerze służbowym nie trzeba wpisywać żadnych ścieżek do kodu:
 3. Otwórz główny plik `uruchom_model.py`.
 4. Kliknij strzałkę **Run Python File** ▶ w prawym górnym rogu.
 5. W pierwszym oknie wybierz Excel energii, a w drugim katalog wynikowy.
-6. Potwierdź uruchomienie. Po zakończeniu program pokaże lokalizację
-   `wyniki_mdd.xlsx` i zaproponuje otwarcie folderu.
+6. Potwierdź uruchomienie. Po zakończeniu program pokaże lokalizację raportu
+   `wyniki_mdd.xlsx`, pakietu `pakiet_modelu_mdd.joblib` i zaproponuje otwarcie
+   folderu.
 
 Launcher zawsze odnajduje SQL względem folderu repozytorium, używa CatBoost,
 `min-lead-hours=24` i nie przechowuje żadnej prywatnej ani służbowej ścieżki.
 
+### Pełny trening
+
+`uruchom_model.py` uruchamia profil `full_training`. Czyta cały Excel i wszystkie
+pasujące arkusze `Dane_*`, bez limitu wierszy wejściowych i bez limitu liczby
+rekordów treningowych na kierunek. Chronologiczny OOF nadal służy jako uczciwa
+ocena poza próbą: model oraz kalibracja `alpha` korzystają wyłącznie z danych
+wcześniejszych od ocenianego okna.
+
+Po backteście powstają dwa końcowe modele — `POBRANIE` i `ODDANIE` — uczone na całej
+użytecznej historii. Użyteczna historia oznacza prawidłowe realizacje, dla których
+można zbudować baseline z co najmniej jednej analogicznej godziny D-3...D-14.
+Pierwsze trzy dni danej serii są więc warm-upem bez baseline, a po 14 dniach może
+być dostępne pełne okno 12 lagów.
+
+Pełny przebieg zapisuje `pakiet_modelu_mdd.joblib` do późniejszego, osobnego programu
+scoringowego. Obecny `uruchom_model.py` tworzy bundle, lecz jeszcze nie ładuje go w
+celu wygenerowania kolejnej prognozy. Przyszły scoring będzie osobnym procesem, bez
+ponownego uczenia, ale nadal będzie wymagał bieżących danych i historii D-3...D-14.
+Musi używać mapowania osadzonego w pakiecie oraz odrzucać godziny niepóźniejsze niż
+zapisany cutoff treningu, aby zachować poprawny moment prognozy.
+
+Wczytanie całego Excela może znacząco zwiększyć zużycie pamięci i całkowity czas
+pracy. `max-fit-minutes=3` dotyczy każdego pojedynczego fitu CatBoost; nie ogranicza
+całego pipeline'u, zapytania SQL, odczytu Excela, budowy lagów ani zapisu raportu.
+
 ## Ziarno danych i mapowanie
 
 Jedna obserwacja modelu to jeden oryginalny wiersz Excela. Arkusze `Dane_01`,
-`Dane_02`, ... są scalane, ale zachowane zostają `source_sheet` i `source_row`.
+`Dane_02`, ... są scalane w całości, ale zachowane zostają `source_sheet` i
+`source_row`.
 Kolumny A:I są czytane pozycyjnie, ponieważ na zdjęciach A i D mają ten sam nagłówek
 `Nazwa`:
 
@@ -200,8 +227,9 @@ klientach. Raport zawiera trzy porównywalne warianty: `HYBRYDA_OOF`, diagnostyc
 pełną korektę `KOREKTA_ML_SUROWA_OOF` i `SREDNIA_ANALOGICZNYCH_D3_D14`. Wszystkie są
 liczone na tych samych wierszach OOF. Predykcje zapisują również baseline, surową
 korektę, `blend_alpha`, strategię, liczebność i wynik kalibracji oraz powód fallbacku.
-Ważność cech w profilu pełnym dotyczy modelu residuum i jest mierzona permutacyjnie na
-danych testowych, osobno dla pobrania i oddania.
+Permutacyjna ważność cech może być liczona dla modelu residuum na danych testowych,
+osobno dla pobrania i oddania. Klikalny pełny launcher pomija ten kosztowny etap;
+można go włączyć w ręcznym CLI.
 
 ## Uruchomienie bezpośrednio z SQL Server
 
@@ -250,11 +278,20 @@ python -m mdd_forecasting \
 Wynik zawiera gotowy skoroszyt `wyniki_mdd.xlsx` z arkuszami podsumowania,
 predykcji, metryk, ważności cech, kontroli jakości, mapowania i konfiguracji. Dla
 dużych danych predykcje są dzielone na kolejne arkusze zgodnie z limitem Excela.
-Równolegle zapisywane są CSV oraz modele `joblib`. `wartosc_przewidywana` jest
-wypełniana tylko dla chronologicznego OOF oraz wierszy po ostatniej dostępnej realizacji.
-Brak targetu wewnątrz historii dostaje status `HISTORYCZNY_BRAK_TARGETU`, a nie fałszywy
-status przyszłości. `wartosc_model_pelny` jest wypełniona dla wszystkich wierszy, ale
-dla historii jest in-sample i nie wolno na niej raportować jakości.
+Równolegle zapisywane są CSV, modele kierunkowe oraz kompletny
+`pakiet_modelu_mdd.joblib`. Pakiet przechowuje oba końcowe modele, ich `alpha`, schemat
+cech, konfigurację, mapowanie, profile fallbacku oraz końcówkę historii potrzebną do
+lagów D-3...D-14.
+
+`wartosc_przewidywana` w raporcie treningowym służy przede wszystkim do uczciwego
+OOF. Brak targetu wewnątrz historii dostaje status `HISTORYCZNY_BRAK_TARGETU`, a nie
+fałszywy status przyszłości. Wynik modelu końcowego na historii — jeżeli zostanie
+wyliczony w ręcznym CLI — jest in-sample i nie wolno na nim raportować jakości.
+Klikalny pełny launcher pomija scoring całej historii, aby ograniczyć czas i pamięć.
+
+Pakiet nie wykonuje prognozy samodzielnie. Ten etap tylko go tworzy; osobny program
+scoringowy, który wczyta `pakiet_modelu_mdd.joblib`, bieżące dane, wymaganą historię
+D-3...D-14 i pogodę, będzie kolejnym etapem rozwiązania.
 
 ## Co trzeba zrobić przed produkcją
 

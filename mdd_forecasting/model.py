@@ -37,6 +37,10 @@ class HybridModelArtifact:
     calibration_n: int
     calibration_improvement: float
     calibration_reason: str
+    train_rows: int = 0
+    history_rows: int = 0
+    train_start_utc: str | None = None
+    train_end_utc: str | None = None
     target: str = "residuum_wzgledem_D3_D14"
 
 
@@ -157,7 +161,9 @@ def _make_model(spec: FeatureSpec, config: PipelineConfig):
     return Pipeline([("preprocess", preprocess), ("regressor", regressor)])
 
 
-def _cap_training(frame: pd.DataFrame, max_rows: int) -> pd.DataFrame:
+def _cap_training(frame: pd.DataFrame, max_rows: int | None) -> pd.DataFrame:
+    if max_rows is None:
+        return frame
     if len(frame) <= max_rows:
         return frame
     # Najnowsze obserwacje są najbardziej reprezentatywne; cięcie pozostaje chronologiczne.
@@ -664,13 +670,12 @@ def run_forecasting(
         )
         history = df.loc[train_mask]
         train = _cap_training(history, config.max_train_rows)
-        predict_mask = (
-            df["kierunek_energii_norm"].eq(direction)
-            & df["model_timestamp_utc"].notna()
-        )
+        predict_mask = df["kierunek_energii_norm"].eq(direction) & df[
+            "model_timestamp_utc"
+        ].notna()
+        if not config.score_full_history:
+            predict_mask &= future_mask
         predict_frame = df.loc[predict_mask]
-        if len(history) < config.min_train_rows or predict_frame.empty:
-            continue
 
         oof = df[
             df["kierunek_energii_norm"].eq(direction)
@@ -694,6 +699,10 @@ def run_forecasting(
                 & train["wartosc_bazowa"].notna()
             ).sum()
         )
+        estimator_train = train.loc[
+            train["wartosc_rzeczywista"].notna()
+            & train["wartosc_bazowa"].notna()
+        ]
         final_model = None
         stopped_by_time = False
         if usable_train_rows >= config.min_train_rows:
@@ -731,8 +740,35 @@ def run_forecasting(
             calibration_n=final_selection.n,
             calibration_improvement=final_selection.improvement,
             calibration_reason=final_selection.reason,
+            train_rows=usable_train_rows if final_model is not None else 0,
+            history_rows=len(history),
+            train_start_utc=(
+                None
+                if final_model is None or estimator_train.empty
+                else str(
+                    pd.to_datetime(
+                        estimator_train["model_timestamp_utc"],
+                        errors="coerce",
+                        utc=True,
+                    ).min()
+                )
+            ),
+            train_end_utc=(
+                None
+                if final_model is None or estimator_train.empty
+                else str(
+                    pd.to_datetime(
+                        estimator_train["model_timestamp_utc"],
+                        errors="coerce",
+                        utc=True,
+                    ).max()
+                )
+            ),
         )
         models[direction] = artifact
+
+        if predict_frame.empty:
+            continue
 
         baseline_full = _baseline_for_fold(history, predict_frame)
         if final_model is None:
@@ -840,7 +876,10 @@ def run_forecasting(
 
     df["blad"] = df["wartosc_przewidywana"] - df["wartosc_rzeczywista"]
     df["blad_bezwzgledny"] = df["blad"].abs()
-    df["model_pelny_jest_insample"] = df["wartosc_rzeczywista"].notna()
+    df["model_pelny_jest_insample"] = (
+        df["wartosc_rzeczywista"].notna()
+        & df["wartosc_model_pelny"].notna()
+    )
     df["forecast_cutoff_utc"] = forecast_cutoff
     return ForecastResult(
         predictions=df,

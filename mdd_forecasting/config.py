@@ -102,7 +102,8 @@ class PipelineConfig:
     validation_days: int = 14
     n_splits: int = 3
     min_train_rows: int = 200
-    max_train_rows: int = 1_000_000
+    # None oznacza pełny zbiór. Dodatni limit pozostaje dostępny dla szybkich testów.
+    max_train_rows: int | None = None
     max_iter: int = 220
     learning_rate: float = 0.06
     model_backend: str = "hist_gradient_boosting"
@@ -116,5 +117,6 @@ class PipelineConfig:
     random_state: int = 42
     compute_importance: bool = True
     max_importance_rows: int = 5_000
+    score_full_history: bool = True
     mapping_path: Path = DEFAULT_MAPPING_PATH
     weather_already_vintaged: bool = False
