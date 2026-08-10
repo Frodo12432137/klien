@@ -136,6 +136,21 @@ def add_lag_features(
         else f"lag_srednia_{min(lag_days)}_{max(lag_days)}_dni"
     )
     df[mean_feature] = df[lag_features].mean(axis=1, skipna=True)
+    df["liczba_lagow_bazowych"] = df[lag_features].notna().sum(axis=1).astype(float)
+    df["lag_odchylenie_3_14_dni"] = df[lag_features].std(axis=1, skipna=True)
+    recent_lags = [f"lag_{24 * days}h" for days in lag_days if 3 <= int(days) <= 6]
+    older_lags = [f"lag_{24 * days}h" for days in lag_days if 10 <= int(days) <= 14]
+    if recent_lags and older_lags:
+        df["lag_trend_krotki_vs_dlugi"] = (
+            df[recent_lags].mean(axis=1, skipna=True)
+            - df[older_lags].mean(axis=1, skipna=True)
+        )
+    else:
+        df["lag_trend_krotki_vs_dlugi"] = np.nan
+    lag_7d = "lag_168h"
+    df["lag_7d_vs_srednia"] = (
+        df[lag_7d] - df[mean_feature] if lag_7d in df.columns else np.nan
+    )
     # Baseline jest średnią dostępnych analogicznych godzin D-3...D-14. Model dostaje
     # również wszystkie pojedyncze lagi i może nauczyć się dla nich różnych wag.
     df["wartosc_bazowa"] = df[mean_feature]
@@ -246,5 +261,9 @@ def build_features(
             if tuple(lag_days) == DEFAULT_LAG_DAYS
             else f"lag_srednia_{min(lag_days)}_{max(lag_days)}_dni"
         ),
+        "liczba_lagow_bazowych",
+        "lag_odchylenie_3_14_dni",
+        "lag_trend_krotki_vs_dlugi",
+        "lag_7d_vs_srednia",
     ]
     return df, FeatureSpec(categorical=categorical, numeric=numeric)

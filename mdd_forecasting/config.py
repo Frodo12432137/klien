@@ -109,6 +109,10 @@ class PipelineConfig:
     catboost_depth: int = 8
     max_fit_seconds: float | None = None
     model_progress_interval: int = 0
+    calibration_days: int = 7
+    min_calibration_rows: int = 200
+    min_blend_improvement: float = 0.02
+    blend_grid_steps: int = 21
     random_state: int = 42
     compute_importance: bool = True
     max_importance_rows: int = 5_000

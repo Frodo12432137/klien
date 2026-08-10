@@ -21,8 +21,12 @@ MAX_INPUT_ROWS = 150_000
 INPUT_ROW_SELECTION = "tail"
 VALIDATION_DAYS = 7
 FOLDS = 1
-MAX_TRAIN_ROWS = 60_000
-MAX_ITER = 60
+CALIBRATION_DAYS = 7
+MIN_CALIBRATION_ROWS = 200
+MIN_BLEND_IMPROVEMENT = 0.02
+BLEND_GRID_STEPS = 21
+MAX_TRAIN_ROWS = 100_000
+MAX_ITER = 180
 CATBOOST_DEPTH = 6
 MAX_FIT_MINUTES = 3.0
 MODEL_PROGRESS_INTERVAL = 15
@@ -62,6 +66,14 @@ def build_cli_args(
         str(VALIDATION_DAYS),
         "--folds",
         str(FOLDS),
+        "--calibration-days",
+        str(CALIBRATION_DAYS),
+        "--min-calibration-rows",
+        str(MIN_CALIBRATION_ROWS),
+        "--min-blend-improvement",
+        str(MIN_BLEND_IMPROVEMENT),
+        "--blend-grid-steps",
+        str(BLEND_GRID_STEPS),
         "--max-train-rows",
         str(MAX_TRAIN_ROWS),
         "--max-iter",
@@ -139,8 +151,12 @@ def main() -> int:
             f"Wyniki:\n{output}\n\n"
             f"Model: {MODEL_BACKEND}\nMinimalny lead pogody: {MIN_LEAD_HOURS} h\n"
             f"Początek danych pogodowych: {WEATHER_AVAILABLE_FROM}\n\n"
+            "Model hybrydowy: średnia D-3...D-14 + korekta CatBoost.\n"
+            "Korekta zostanie użyta tylko, jeśli kalibracja potwierdzi co najmniej "
+            f"{MIN_BLEND_IMPROVEMENT:.0%} poprawy; inaczej działa bezpieczny fallback "
+            "do średniej.\n\n"
             "Profil szybki: najnowsze 150 000 wierszy, 1 backtest, "
-            "maks. 3 minuty na pojedynczy model.",
+            "7 dni kalibracji, maks. 3 minuty na pojedynczy model.",
             parent=root,
         )
         if not confirmed:

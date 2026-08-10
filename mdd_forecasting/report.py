@@ -65,7 +65,12 @@ def _number_format(column: str) -> str | None:
         return "yyyy-mm-dd"
     if any(token in normalized for token in ("timestamp", "_time", "czas", "valid_from", "valid_to")):
         return "yyyy-mm-dd hh:mm:ss"
-    if normalized in {"wape", "smape", "udzial"} or normalized.endswith("_pct"):
+    if normalized in {
+        "wape",
+        "smape",
+        "udzial",
+        "kalibracja_poprawa_mae",
+    } or normalized.endswith("_pct"):
         return "0.0%"
     if normalized in {
         "source_row",
@@ -74,6 +79,8 @@ def _number_format(column: str) -> str | None:
         "n",
         "liczba",
         "liczba_foldow",
+        "liczba_lagow_bazowych",
+        "kalibracja_n",
     }:
         return "#,##0"
     if any(
@@ -95,6 +102,7 @@ def _number_format(column: str) -> str | None:
             "lead",
             "waznosc",
             "odchylenie",
+            "blend_alpha",
         )
     ):
         return "#,##0.00"
@@ -216,28 +224,33 @@ def _summary_rows(
         value = pd.to_numeric(selected.iloc[0][name], errors="coerce")
         return None if pd.isna(value) else float(value)
 
-    ml_mae = metric("ML_OOF", "mae")
+    primary_model = (
+        "HYBRYDA_OOF"
+        if metric("HYBRYDA_OOF", "mae") is not None
+        else "ML_OOF"
+    )
+    hybrid_mae = metric(primary_model, "mae")
     baseline_mae = metric("SREDNIA_ANALOGICZNYCH_D3_D14", "mae")
     improvement = (
         None
-        if ml_mae is None or baseline_mae in (None, 0)
-        else float((baseline_mae - ml_mae) / baseline_mae)
+        if hybrid_mae is None or baseline_mae in (None, 0)
+        else float((baseline_mae - hybrid_mae) / baseline_mae)
     )
     return [
         ["Dane", "Wszystkie wiersze", len(predictions), "Każdy oryginalny wiersz energii"],
         ["Dane", "Wiersze z wykonaniem", int(actual.notna().sum()), "Target Wartość jest dostępny"],
-        ["Ocena", "Predykcje OOF", int(status.eq("OOF_BACKTEST").sum()), "Tylko te wiersze służą do uczciwej oceny"],
+        ["Ocena", "Predykcje OOF hybrydy", int(status.eq("OOF_BACKTEST").sum()), "Tylko te wiersze służą do uczciwej oceny"],
         ["Prognoza", "Wiersze przyszłe", int(status.eq("PROGNOZA_PRZYSZLA").sum()), "Wiersze po ostatnim znanym wykonaniu"],
         ["Prognoza", "Przyszłe bez pogody", int(pd.Series(future_without_weather).fillna(False).sum()), "Predykcja używa historii energii i kalendarza"],
         ["Jakość", "Wiersze przed dostępnością pogody", int(weather_status.eq("PRZED_STARTEM_POGODY").sum()), "Oczekiwany brak przed 2024-10-01"],
         ["Jakość", "Dopasowanie pogody po starcie", post_start_weather_share, "Dopasowane / (dopasowane + brak rekordu); bez błędnych kluczy i mapowania"],
         ["Jakość", "Dopasowanie pogody — wszystkie wiersze", weather_share, "Wskaźnik pomocniczy obejmujący okres sprzed 2024-10-01"],
         ["Jakość", "Dopasowane rekordy z NULL", int(partial_weather.sum()), "Co najmniej jedna z cech pogodowych jest pusta; wiersz pozostaje"],
-        ["Model", "Wytrenowane kierunki", ", ".join(sorted(models)) or "brak", "Oddzielne modele pobrania i oddania"],
-        ["Model", "MAE ML (OOF)", ml_mae, "Niżej = lepiej; jednostka taka jak Wartość"],
+        ["Hybryda", "Wytrenowane kierunki", ", ".join(sorted(models)) or "brak", "Oddzielne korekty residualne pobrania i oddania"],
+        ["Hybryda", "MAE hybrydy (OOF)", hybrid_mae, "Niżej = lepiej; jednostka taka jak Wartość"],
         ["Baseline", "MAE średniej D-3...D-14", baseline_mae, "Średnia analogicznej godziny z 3–14 dni wcześniej"],
-        ["Model", "Poprawa MAE vs baseline", improvement, "Wartość dodatnia oznacza poprawę"],
-        ["Model", "WAPE ML (OOF)", metric("ML_OOF", "wape"), "Błąd bezwzględny względem wolumenu"],
+        ["Hybryda", "Poprawa MAE vs baseline", improvement, "Korekta ML jest używana tylko po spełnieniu progu poprawy"],
+        ["Hybryda", "WAPE hybrydy (OOF)", metric(primary_model, "wape"), "Błąd bezwzględny względem wolumenu"],
         ["Baseline", "WAPE średniej D-3...D-14", metric("SREDNIA_ANALOGICZNYCH_D3_D14", "wape"), "Punkt odniesienia"],
     ]
 

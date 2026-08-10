@@ -82,7 +82,10 @@ Gotowy ekstrakt jest w `sql/pogoda_mdd.sql`.
 
 - wartości z analogicznej godziny każdego dnia od D-3 do D-14, czyli lagi
   `72, 96, 120, ..., 336 h`;
-- średnia ze wszystkich dostępnych analogicznych godzin w tym oknie.
+- średnia ze wszystkich dostępnych analogicznych godzin w tym oknie, czyli
+  `wartosc_bazowa`;
+- liczba i odchylenie dostępnych lagów;
+- trend D-3...D-6 względem D-10...D-14 oraz różnica D-7 względem średniej.
 
 To zwykle najmocniejsze zmienne dla poboru. Lagi są łączone po tej samej godzinie
 handlowej 3–14 dni wcześniej, a kolejność walidacji jest oparta na UTC. Model celowo
@@ -135,19 +138,32 @@ kolumn tylko dlatego, że są dostępne, zwiększa ryzyko szumu i niestabilnośc
 
 ### Kategorie
 
-`klient_nazwa`, `grupa`, `rodzaj`, `oddzial_code`, `punkt` i kierunek energii są
-kodowane przez cross-fitted target encoding wewnątrz każdego okna treningowego.
-Nie są traktowane jako zwykłe liczby.
+`klient_nazwa`, `grupa`, `rodzaj`, `oddzial_code`, `punkt` i kierunek energii nie są
+traktowane jako zwykłe liczby. CatBoost obsługuje je natywnie jako kategorie, a
+awaryjny backend sklearn stosuje target encoding wewnątrz pipeline'u treningowego.
 
 ## Algorytm i uczenie
 
-Przetestowany backend MVP używa `HistGradientBoostingRegressor` na `log1p(Wartość)`.
-Gradient boosting dobrze odwzorowuje progi, nieliniową temperaturę, kształt dobowy,
-promieniowanie i interakcje pogody. Transformacja `log1p` stabilizuje bardzo różne
-skale klientów i działa również dla zer. Predykcja końcowa jest odwracana przez
-`expm1` i ograniczana od dołu do zera. Dla produkcji dostępny jest również CatBoost,
-który bezpośrednio obsługuje liczne nazwy klientów jako kategorie; jego przewagę trzeba
-potwierdzić chronologicznym backtestem, a nie zakładać z góry.
+Model jest hybrydą baseline i korekty ML:
+
+```text
+baseline(t) = średnia tej samej godziny z D-3...D-14
+residuum(t) = wartość_rzeczywista(t) - baseline(t)
+korekta(t)  = CatBoost(cechy klienta, czasu, historii i pogody)
+prognoza(t) = max(0, baseline(t) + alpha * korekta(t))
+```
+
+CatBoost uczy się podpisanego residuum z funkcją straty MAE na oryginalnej skali,
+bez `log1p/expm1`. Dzięki temu może zarówno podwyższyć, jak i obniżyć baseline, a
+poprzednie systematyczne zaniżanie dużych wolumenów nie jest wzmacniane transformacją.
+Awaryjny `HistGradientBoostingRegressor` używa tego samego celu resztowego.
+
+`alpha` jest wybierane oddzielnie dla pobrania i oddania na siedmiodniowym oknie
+kalibracyjnym leżącym przed testem OOF. Sprawdzanych jest 21 wartości od 0 do 1.
+Korekta zostaje włączona wyłącznie przy co najmniej 200 rekordach i minimum 2%
+poprawy MAE względem baseline. W przeciwnym razie `alpha=0`, więc wynik jest dokładnie
+baseline. Ten mechanizm ogranicza ryzyko użycia słabszej korekty, ale nie gwarantuje
+przewagi w każdym nieznanym przyszłym okresie.
 
 Pobranie i oddanie są rozdzielone, bo mają różną fizykę. Pobranie zależy zwykle od
 kalendarza, historii i temperatury. Oddanie zależy mocniej od promieniowania,
@@ -164,11 +180,12 @@ fold 2: przeszłość ----------------------> 14 dni testu
 fold 3: przeszłość ----------------------------------> 14 dni testu
 ```
 
-Każda oceniana predykcja powstaje z modelu, który nie widział targetów z okna testowego.
-Cechy lagowe są aktualizowane as-of dla danej prognozowanej godziny, więc mogą użyć
-tylko realizacji sprzed co najmniej trzech dni. Punktem odniesienia jest średnia
-analogicznej godziny z D-3...D-14, a przy całkowitym braku historii mediana danego
-klienta, kierunku i godziny.
+Każdy fold zachowuje kolejność `trening -> kalibracja alpha -> test`. Model residualny
+i wybór `alpha` nie widzą targetów z okna testowego. Cechy lagowe są aktualizowane
+as-of dla danej prognozowanej godziny, więc używają tylko realizacji sprzed co najmniej
+trzech dni. Przy braku naturalnej średniej baseline korzysta kolejno z mediany
+klient–kierunek–godzina, oddział–kierunek–godzina, kierunek–godzina, kierunku i całego
+prefiksu treningowego.
 
 Raportowane metryki:
 
@@ -179,8 +196,12 @@ Raportowane metryki:
   MAPE przy zerach.
 
 Metryki są liczone globalnie, według kierunku, miasta oraz jako średnia makro po
-klientach. Ważność cech jest mierzona permutacyjnie na danych testowych, osobno dla
-pobrania i oddania.
+klientach. Raport zawiera trzy porównywalne warianty: `HYBRYDA_OOF`, diagnostyczną
+pełną korektę `KOREKTA_ML_SUROWA_OOF` i `SREDNIA_ANALOGICZNYCH_D3_D14`. Wszystkie są
+liczone na tych samych wierszach OOF. Predykcje zapisują również baseline, surową
+korektę, `blend_alpha`, strategię, liczebność i wynik kalibracji oraz powód fallbacku.
+Ważność cech w profilu pełnym dotyczy modelu residuum i jest mierzona permutacyjnie na
+danych testowych, osobno dla pobrania i oddania.
 
 ## Uruchomienie bezpośrednio z SQL Server
 

@@ -6,9 +6,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-from mdd_forecasting.cli import _infer_sql_date_range, _parser, _validate_args
+from mdd_forecasting.cli import (
+    _infer_sql_date_range,
+    _parser,
+    _prediction_columns,
+    _validate_args,
+)
 from mdd_forecasting.config import PipelineConfig, WEATHER_FEATURES
 from mdd_forecasting.database import (
     SqlServerSettings,
@@ -16,7 +22,7 @@ from mdd_forecasting.database import (
     weather_query_parameters,
 )
 from mdd_forecasting.generate_demo_data import generate
-from mdd_forecasting.features import add_lag_features
+from mdd_forecasting.features import FeatureSpec, add_lag_features
 from mdd_forecasting.io import (
     join_energy_weather,
     normalize_energy,
@@ -24,9 +30,20 @@ from mdd_forecasting.io import (
     prepare_joined_dataset,
     read_energy_file,
 )
-from mdd_forecasting.model import _CatBoostTimeLimit, run_forecasting
+from mdd_forecasting.model import (
+    HybridModelArtifact,
+    _baseline_for_fold,
+    _blend_prediction,
+    _CatBoostTimeLimit,
+    _fit_residual_model,
+    _select_blend_alpha,
+    _split_calibration_window,
+    run_forecasting,
+)
 from mdd_forecasting.report import write_results_workbook
 from uruchom_model import (
+    BLEND_GRID_STEPS,
+    CALIBRATION_DAYS,
     CATBOOST_DEPTH,
     EXECUTION_PROFILE,
     FOLDS,
@@ -35,6 +52,8 @@ from uruchom_model import (
     MAX_INPUT_ROWS,
     MAX_ITER,
     MAX_TRAIN_ROWS,
+    MIN_BLEND_IMPROVEMENT,
+    MIN_CALIBRATION_ROWS,
     MODEL_BACKEND,
     MODEL_PROGRESS_INTERVAL,
     MIN_LEAD_HOURS,
@@ -67,6 +86,10 @@ class TestMddForecasting(unittest.TestCase):
             "--input-row-selection": INPUT_ROW_SELECTION,
             "--validation-days": str(VALIDATION_DAYS),
             "--folds": str(FOLDS),
+            "--calibration-days": str(CALIBRATION_DAYS),
+            "--min-calibration-rows": str(MIN_CALIBRATION_ROWS),
+            "--min-blend-improvement": str(MIN_BLEND_IMPROVEMENT),
+            "--blend-grid-steps": str(BLEND_GRID_STEPS),
             "--max-train-rows": str(MAX_TRAIN_ROWS),
             "--max-iter": str(MAX_ITER),
             "--catboost-depth": str(CATBOOST_DEPTH),
@@ -102,6 +125,18 @@ class TestMddForecasting(unittest.TestCase):
         args.min_train_rows = 500
         args.max_train_rows = 100
         with self.assertRaisesRegex(ValueError, "max-train-rows"):
+            _validate_args(args)
+
+        args.min_train_rows = 100
+        args.max_train_rows = 500
+        for invalid_improvement in (-0.01, 1.0):
+            args.min_blend_improvement = invalid_improvement
+            with self.assertRaisesRegex(ValueError, "min-blend-improvement"):
+                _validate_args(args)
+
+        args.min_blend_improvement = 0.02
+        args.blend_grid_steps = 1
+        with self.assertRaisesRegex(ValueError, "blend-grid-steps"):
             _validate_args(args)
 
     def test_tail_input_keeps_newest_excel_rows(self):
@@ -155,6 +190,196 @@ class TestMddForecasting(unittest.TestCase):
         self.assertNotIn("lag_48h", with_lags.columns)
         self.assertEqual(last["lag_srednia_3_14_dni"], 6.5)
         self.assertEqual(last["wartosc_bazowa"], 6.5)
+        self.assertEqual(last["liczba_lagow_bazowych"], 12.0)
+        self.assertAlmostEqual(last["lag_odchylenie_3_14_dni"], 3.6055512755)
+        self.assertEqual(last["lag_trend_krotki_vs_dlugi"], 7.5)
+        self.assertEqual(last["lag_7d_vs_srednia"], 1.5)
+
+    def test_calibration_window_is_strictly_before_validation(self):
+        validation_start = pd.Timestamp("2025-01-10 00:00:00", tz="UTC")
+        history = pd.DataFrame(
+            {
+                "model_timestamp_utc": pd.to_datetime(
+                    [
+                        "2025-01-07 23:59:59+00:00",
+                        "2025-01-08 00:00:00+00:00",
+                        "2025-01-09 23:59:59+00:00",
+                        "2025-01-10 00:00:00+00:00",
+                        None,
+                    ],
+                    utc=True,
+                )
+            }
+        )
+        config = PipelineConfig(calibration_days=2)
+
+        fit, calibration = _split_calibration_window(
+            history, validation_start, config
+        )
+
+        self.assertEqual(fit.index.tolist(), [0])
+        self.assertEqual(calibration.index.tolist(), [1, 2])
+        self.assertLess(
+            fit["model_timestamp_utc"].max(),
+            calibration["model_timestamp_utc"].min(),
+        )
+        self.assertTrue(
+            calibration["model_timestamp_utc"].lt(validation_start).all()
+        )
+
+    def test_baseline_preserves_zero_and_uses_hierarchical_train_fallback(self):
+        train = pd.DataFrame(
+            {
+                "oddzial_code": ["BIA", "BIA", "BIA", "LUB", "LUB"],
+                "klient_nazwa": ["K1", "K1", "K2", "K3", "K4"],
+                "kierunek_energii_norm": [
+                    "POBRANIE",
+                    "POBRANIE",
+                    "POBRANIE",
+                    "POBRANIE",
+                    "ODDANIE",
+                ],
+                "godzina": [8, 8, 8, 8, 9],
+                "wartosc_rzeczywista": [10.0, 20.0, 30.0, 50.0, 100.0],
+            }
+        )
+        test = pd.DataFrame(
+            {
+                "wartosc_bazowa": [0.0, np.nan, np.nan, np.nan, np.nan, np.nan],
+                "oddzial_code": ["BIA", "BIA", "BIA", "XYZ", "XYZ", "XYZ"],
+                "klient_nazwa": ["NOWY", "K1", "NOWY", "NOWY", "NOWY", "NOWY"],
+                "kierunek_energii_norm": [
+                    "POBRANIE",
+                    "POBRANIE",
+                    "POBRANIE",
+                    "POBRANIE",
+                    "ODDANIE",
+                    "BRAK",
+                ],
+                "godzina": [8, 8, 8, 8, 7, 7],
+            }
+        )
+
+        baseline = _baseline_for_fold(train, test)
+
+        np.testing.assert_array_equal(
+            baseline.to_numpy(dtype=float),
+            np.array([0.0, 15.0, 20.0, 25.0, 100.0, 30.0]),
+        )
+
+    def test_blend_alpha_finds_known_optimum(self):
+        selection = _select_blend_alpha(
+            actual=np.array([12.0, 8.0, 12.0, 8.0]),
+            baseline=np.array([10.0, 10.0, 10.0, 10.0]),
+            correction=np.array([4.0, -4.0, 4.0, -4.0]),
+            min_rows=1,
+            min_improvement=0.0,
+            grid_steps=5,
+        )
+
+        self.assertEqual(selection.alpha, 0.5)
+        self.assertEqual(selection.n, 4)
+        self.assertEqual(selection.hybrid_mae, 0.0)
+        self.assertEqual(selection.improvement, 1.0)
+        self.assertEqual(selection.reason, "HYBRYDA_WYBRANA")
+
+    def test_blend_falls_back_when_correction_is_worse(self):
+        selection = _select_blend_alpha(
+            actual=np.array([100.0, 120.0, 80.0]),
+            baseline=np.array([101.0, 119.0, 81.0]),
+            correction=np.array([50.0, -50.0, 50.0]),
+            min_rows=1,
+            min_improvement=0.0,
+            grid_steps=5,
+        )
+
+        self.assertEqual(selection.alpha, 0.0)
+        self.assertEqual(selection.hybrid_mae, selection.baseline_mae)
+        self.assertEqual(selection.reason, "BRAK_POTWIERDZONEJ_POPRAWY")
+
+    def test_blend_tie_prefers_zero_alpha(self):
+        selection = _select_blend_alpha(
+            actual=np.array([9.0, 11.0]),
+            baseline=np.array([10.0, 10.0]),
+            correction=np.array([0.0, 0.0]),
+            min_rows=1,
+            min_improvement=0.0,
+            grid_steps=5,
+        )
+
+        self.assertEqual(selection.alpha, 0.0)
+        self.assertEqual(selection.hybrid_mae, selection.baseline_mae)
+        self.assertEqual(selection.reason, "BRAK_POTWIERDZONEJ_POPRAWY")
+
+    def test_blend_requires_minimum_confirmed_improvement(self):
+        selection = _select_blend_alpha(
+            actual=np.array([10.0, 10.0]),
+            baseline=np.array([9.0, 11.0]),
+            correction=np.array([0.1, -0.1]),
+            min_rows=1,
+            min_improvement=0.20,
+            grid_steps=11,
+        )
+
+        self.assertEqual(selection.alpha, 0.0)
+        self.assertAlmostEqual(selection.improvement, 0.10)
+        self.assertEqual(selection.reason, "BRAK_POTWIERDZONEJ_POPRAWY")
+
+    def test_residual_model_keeps_signed_target_without_log_transform(self):
+        class CapturingEstimator:
+            def fit(self, features, target):
+                self.features = features.copy()
+                self.target = pd.Series(target).copy()
+                return self
+
+            def predict(self, features):
+                return np.zeros(len(features), dtype=float)
+
+        estimator = CapturingEstimator()
+        train = pd.DataFrame(
+            {
+                "feature": [1.0, 2.0, 3.0, 4.0],
+                "wartosc_rzeczywista": [8.0, 25.0, 27.0, 99.0],
+                "wartosc_bazowa": [10.0, 20.0, 30.0, np.nan],
+            }
+        )
+        spec = FeatureSpec(categorical=[], numeric=["feature"])
+        config = PipelineConfig(min_train_rows=1)
+
+        with patch("mdd_forecasting.model._make_model", return_value=estimator):
+            fitted = _fit_residual_model(train, spec, config)
+
+        self.assertIs(fitted, estimator)
+        np.testing.assert_array_equal(
+            estimator.target.to_numpy(dtype=float),
+            np.array([-2.0, 5.0, -3.0]),
+        )
+        self.assertEqual(estimator.features.index.tolist(), [0, 1, 2])
+
+    def test_blend_prediction_keeps_negative_correction_and_clips_final_value(self):
+        predictions = _blend_prediction(
+            baseline=np.array([10.0, 2.0]),
+            correction=np.array([-4.0, -10.0]),
+            alpha=0.5,
+        )
+
+        np.testing.assert_array_equal(predictions, np.array([8.0, 0.0]))
+
+    def test_compact_output_contains_hybrid_audit_columns(self):
+        audit_columns = {
+            "korekta_ml_surowa",
+            "wartosc_ml_przed_blendem",
+            "blend_alpha",
+            "strategia_predykcji",
+            "kalibracja_n",
+            "kalibracja_poprawa_mae",
+            "kalibracja_powod",
+        }
+        frame = pd.DataFrame(columns=["wartosc_przewidywana", *sorted(audit_columns)])
+
+        selected = set(_prediction_columns(frame, compact=True))
+
+        self.assertTrue(audit_columns.issubset(selected), audit_columns - selected)
 
     def test_catboost_time_callback_stops_after_deadline(self):
         with patch(
@@ -193,13 +418,83 @@ class TestMddForecasting(unittest.TestCase):
                 energy_path, weather_path, config=config
             )
             messages: list[str] = []
-            with patch("mdd_forecasting.model._fit_log_model", side_effect=fake_fit):
+            with patch("mdd_forecasting.model._fit_residual_model", side_effect=fake_fit):
                 run_forecasting(joined, config, progress_callback=messages.append)
 
         self.assertEqual(len(fit_sizes), 4)
         self.assertLessEqual(max(fit_sizes), 100)
         self.assertTrue(any("12 lagów" in message for message in messages))
         self.assertTrue(any("Model końcowy POBRANIE" in message for message in messages))
+
+    def test_outer_oof_target_does_not_change_fold_alpha(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            energy_path, weather_path = generate(Path(tmp), days=10, seed=19)
+            config = PipelineConfig(
+                validation_days=2,
+                n_splits=1,
+                calibration_days=2,
+                min_calibration_rows=1,
+                min_blend_improvement=0.0,
+                blend_grid_steps=5,
+                min_train_rows=50,
+                max_train_rows=50_000,
+                max_iter=5,
+                compute_importance=False,
+            )
+            joined, _, _ = prepare_joined_dataset(
+                energy_path, weather_path, config=config
+            )
+            lagged = add_lag_features(joined, lag_days=config.lag_days)
+            correction_by_index = (
+                lagged["wartosc_rzeczywista"] - lagged["wartosc_bazowa"]
+            )
+
+            class IndexedCorrectionModel:
+                _mdd_stopped_by_time = False
+
+                def predict(self, features):
+                    return (
+                        correction_by_index.reindex(features.index)
+                        .fillna(0.0)
+                        .to_numpy(dtype=float)
+                    )
+
+            def fake_fit(_train, _spec, _config):
+                return IndexedCorrectionModel()
+
+            actual_times = pd.to_datetime(
+                joined["model_timestamp_utc"], errors="coerce", utc=True
+            )
+            validation_end = actual_times.max().floor("D") + pd.Timedelta(days=1)
+            validation_start = validation_end - pd.Timedelta(days=2)
+            outer_mask = actual_times.ge(validation_start) & actual_times.lt(
+                validation_end
+            )
+            modified = joined.copy()
+            modified.loc[outer_mask, "wartosc_rzeczywista"] = lagged.loc[
+                outer_mask, "wartosc_bazowa"
+            ].to_numpy()
+
+            with patch(
+                "mdd_forecasting.model._fit_residual_model", side_effect=fake_fit
+            ):
+                original_result = run_forecasting(joined, config)
+                modified_result = run_forecasting(modified, config)
+
+        def fold_alphas(result):
+            oof = result.predictions[
+                result.predictions["status_predykcji"].eq("OOF_BACKTEST")
+            ]
+            return (
+                oof.groupby(["fold", "kierunek_energii_norm"])["blend_alpha"]
+                .first()
+                .sort_index()
+            )
+
+        original_alphas = fold_alphas(original_result)
+        modified_alphas = fold_alphas(modified_result)
+        self.assertTrue(original_alphas.gt(0.0).all())
+        pd.testing.assert_series_equal(original_alphas, modified_alphas)
 
     def test_sql_parameters_and_integrated_connection(self):
         params = weather_query_parameters("2025-01-01", "2025-02-01", 24)
@@ -401,12 +696,58 @@ class TestMddForecasting(unittest.TestCase):
             self.assertGreater(int(evaluated.sum()), 0)
             self.assertFalse(result.metrics.empty)
             self.assertIn("POGODA", set(result.metrics["zakres"]))
+            self.assertIn("HYBRYDA_OOF", set(result.metrics["model"]))
+            self.assertIn(
+                "SREDNIA_ANALOGICZNYCH_D3_D14", set(result.metrics["model"])
+            )
+            global_metrics = result.metrics[
+                result.metrics["zakres"].eq("GLOBAL")
+                & result.metrics["wartosc_zakresu"].eq("ALL")
+            ].set_index("model")
+            self.assertEqual(
+                int(global_metrics.loc["HYBRYDA_OOF", "n"]),
+                int(global_metrics.loc["SREDNIA_ANALOGICZNYCH_D3_D14", "n"]),
+            )
             self.assertEqual(set(result.models), {"POBRANIE", "ODDANIE"})
+            self.assertTrue(
+                all(
+                    isinstance(artifact, HybridModelArtifact)
+                    for artifact in result.models.values()
+                )
+            )
+            self.assertTrue(
+                all(0.0 <= artifact.alpha <= 1.0 for artifact in result.models.values())
+            )
+            expected_audit_columns = {
+                "korekta_ml_surowa",
+                "wartosc_ml_przed_blendem",
+                "blend_alpha",
+                "strategia_predykcji",
+                "kalibracja_n",
+                "kalibracja_poprawa_mae",
+                "kalibracja_powod",
+            }
+            self.assertTrue(
+                expected_audit_columns.issubset(result.predictions.columns),
+                expected_audit_columns - set(result.predictions.columns),
+            )
+            expected_lag_features = {
+                "liczba_lagow_bazowych",
+                "lag_odchylenie_3_14_dni",
+                "lag_trend_krotki_vs_dlugi",
+                "lag_7d_vs_srednia",
+            }
+            self.assertTrue(
+                expected_lag_features.issubset(result.feature_spec.numeric),
+                expected_lag_features - set(result.feature_spec.numeric),
+            )
             future_predictions = result.predictions.loc[future_rows]
             self.assertTrue(
                 future_predictions["status_predykcji"].eq("PROGNOZA_PRZYSZLA").all()
             )
             self.assertTrue(future_predictions["prognoza_bez_pogody"].all())
+            self.assertTrue(future_predictions["blend_alpha"].between(0.0, 1.0).all())
+            self.assertTrue(future_predictions["strategia_predykcji"].notna().all())
             self.assertEqual(
                 result.predictions.loc[historical_gap_index, "status_predykcji"],
                 "HISTORYCZNY_BRAK_TARGETU",

@@ -36,7 +36,7 @@ Launcher działa teraz w profilu `fast_30min`, przygotowanym dla laptopa służb
   ładować kilka milionów rekordów do RAM;
 - wykonuje jeden siedmiodniowy backtest i dwa modele końcowe, czyli najwyżej cztery
   fity zamiast ośmiu;
-- używa najwyżej 60 000 rekordów treningowych na kierunek, 60 iteracji i głębokości 6;
+- używa najwyżej 100 000 rekordów treningowych na kierunek, 180 iteracji i głębokości 6;
 - zatrzymuje pojedynczy fit CatBoost po najbliższej iteracji po przekroczeniu 3 minut;
 - wyłącza kosztowną permutacyjną ważność cech i zapisuje kompaktowy raport;
 - przerywa zapytanie SQL po 5 minutach zamiast czekać bez końca;
@@ -114,7 +114,11 @@ nie jest powodem usunięcia wiersza energii.
 
 - wartości z analogicznej godziny każdego dnia od D-3 do D-14, czyli lagi
   `72, 96, 120, ..., 336 h`;
-- średnia ze wszystkich dostępnych analogicznych godzin w tym oknie.
+- średnia ze wszystkich dostępnych analogicznych godzin w tym oknie — bazowa
+  prognoza `wartosc_bazowa`;
+- liczba dostępnych lagów oraz ich odchylenie standardowe;
+- różnica średniej z D-3...D-6 względem D-10...D-14 i różnica D-7 względem
+  średniej D-3...D-14.
 
 To zwykle najmocniejsze zmienne dla poboru. Lagi są łączone po tej samej godzinie
 handlowej 3–14 dni wcześniej, a kolejność walidacji jest oparta na UTC. Model celowo
@@ -173,18 +177,49 @@ Nie są traktowane jako zwykłe liczby.
 
 ## Algorytm i uczenie
 
-Przetestowany backend MVP używa `HistGradientBoostingRegressor` na `log1p(Wartość)`.
-Gradient boosting dobrze odwzorowuje progi, nieliniową temperaturę, kształt dobowy,
-promieniowanie i interakcje pogody. Transformacja `log1p` stabilizuje bardzo różne
-skale klientów i działa również dla zer. Predykcja końcowa jest odwracana przez
-`expm1` i ograniczana od dołu do zera. Dla produkcji dostępny jest również CatBoost,
-który bezpośrednio obsługuje liczne nazwy klientów jako kategorie; jego przewagę trzeba
-potwierdzić chronologicznym backtestem, a nie zakładać z góry.
+Model jest hybrydą mocnego, prostego baseline oraz korekty ML. Dla godziny `t` działa
+według schematu:
+
+```text
+baseline(t) = średnia dostępnych realizacji z tej samej godziny D-3...D-14
+residuum(t) = wartość_rzeczywista(t) - baseline(t)
+korekta(t)  = CatBoost(cechy klienta, czasu, historii i pogody)
+prognoza(t) = max(0, baseline(t) + alpha * korekta(t))
+```
+
+CatBoost nie przewiduje więc całej wartości od zera, tylko podpisaną korektę
+`residuum_wzgledem_D3_D14`. Uczy się z funkcją straty MAE na skali oryginalnej, bez
+transformacji `log1p`, która w poprzednim wariancie sprzyjała zaniżaniu dużych
+wolumenów. Jeżeli brakuje naturalnej średniej D-3...D-14, sam baseline korzysta z
+historycznej mediany klienta, kierunku i godziny, a następnie z mediany zbioru
+treningowego. Awaryjny backend `HistGradientBoostingRegressor` stosuje ten sam cel
+resztowy i funkcję straty odporną na pojedyncze skoki.
+
+Współczynnik `alpha` określa, jak dużą część korekty ML wolno dodać do baseline.
+Nie jest dobierany na ocenianym oknie. Dla każdego kierunku i folda model wydziela
+wcześniejsze okno kalibracyjne, domyślnie 7 dni, i sprawdza siatkę 21 wartości
+`alpha` od 0 do 1 według MAE. Korekta zostaje zaakceptowana tylko wtedy, gdy:
+
+- kalibracja zawiera co najmniej 200 prawidłowych obserwacji;
+- najlepsza hybryda poprawia MAE baseline o co najmniej 2%.
+
+Jeżeli którykolwiek warunek nie jest spełniony, ustawiane jest `alpha=0`, więc
+prognozą staje się baseline D-3...D-14. Powód decyzji jest zapisywany w raporcie,
+np. `HYBRYDA_WYBRANA`, `BRAK_POTWIERDZONEJ_POPRAWY` lub
+`ZA_MALO_KALIBRACJI`. Ten bezpiecznik chroni przed użyciem korekty, która nie
+potwierdziła wartości na wcześniejszych danych; nie stanowi jednak gwarancji, że
+hybryda będzie lepsza od baseline w każdym przyszłym okresie.
 
 Pobranie i oddanie są rozdzielone, bo mają różną fizykę. Pobranie zależy zwykle od
 kalendarza, historii i temperatury. Oddanie zależy mocniej od promieniowania,
 zachmurzenia i/lub wiatru. Jeżeli później dostępny będzie typ źródła (`PV`, `wiatr`,
 inne), należy go koniecznie dodać; bez niego model uśrednia różne mechanizmy.
+
+Każdy z dwóch kierunków ma oddzielny model resztowy i oddzielnie skalibrowane
+`alpha`. Do CatBoost trafiają pojedyncze lagi D-3...D-14, baseline i diagnostyka
+lagów, cechy kalendarzowe, pogodowe i ich interakcje oraz kategorie klienta, grupy,
+rodzaju, oddziału i punktu pogodowego. Cechy kierunku wiatru i czasu są kodowane
+cyklicznie, a braki pogody pozostają brakami, zamiast być sztucznie zamieniane na zero.
 
 ## Walidacja
 
@@ -196,11 +231,13 @@ fold 2: przeszłość ----------------------> 14 dni testu
 fold 3: przeszłość ----------------------------------> 14 dni testu
 ```
 
-Każda oceniana predykcja powstaje z modelu, który nie widział targetów z okna testowego.
-Cechy lagowe są aktualizowane as-of dla danej prognozowanej godziny, więc mogą użyć
-tylko realizacji sprzed co najmniej trzech dni. Punktem odniesienia jest średnia
-analogicznej godziny z D-3...D-14, a przy całkowitym braku historii mediana danego
-klienta, kierunku i godziny.
+Każdy fold zachowuje kolejność `trening -> kalibracja alpha -> test`. Ani model
+resztowy, ani wybór `alpha` nie widzą targetów z okna testowego. Cechy lagowe są
+aktualizowane as-of dla danej prognozowanej godziny, więc mogą użyć tylko realizacji
+sprzed co najmniej trzech dni. `wartosc_przewidywana` z wierszy
+`OOF_BACKTEST` jest finalną hybrydą albo baseline po bezpiecznym fallbacku i tylko
+te wiersze służą do uczciwej oceny. `wartosc_model_pelny` na danych historycznych
+jest wynikiem modelu końcowego in-sample i nie wolno z niej raportować jakości.
 
 Raportowane metryki:
 
@@ -217,6 +254,27 @@ się sezonem i składem klientów. Wpływ samych cech pogodowych należy późni
 testem ablation na identycznych wierszach. W profilu pełnym ważność cech jest mierzona
 permutacyjnie na danych testowych, osobno dla pobrania i oddania. Profil szybki pomija
 ten etap, ponieważ był jednym z największych kosztów czasowych.
+
+Raport porównuje finalne prognozy OOF z baseline D-3...D-14 na dokładnie tych samych
+wierszach. Dodatkowe kolumny audytowe pozwalają odtworzyć każdą decyzję:
+
+| Kolumna | Znaczenie |
+|---|---|
+| `wartosc_bazowa_backtest` | baseline policzony bez podglądania okna testowego |
+| `liczba_lagow_bazowych` | liczba dostępnych analogicznych godzin D-3...D-14 |
+| `residuum_rzeczywiste` | realizacja minus baseline, czyli target modelu korekty |
+| `korekta_ml_surowa` | podpisana korekta przewidziana przez model resztowy |
+| `wartosc_ml_przed_blendem` | diagnostyczny kandydat baseline + pełna korekta ML |
+| `blend_alpha` | przyjęta część korekty, od 0 do 1 |
+| `strategia_predykcji` | informacja, czy użyto hybrydy, czy fallbacku do baseline |
+| `kalibracja_n` | liczba obserwacji użytych do wyboru `alpha` |
+| `kalibracja_poprawa_mae` | względna poprawa MAE na wcześniejszym oknie kalibracyjnym |
+| `kalibracja_powod` | powód wyboru hybrydy albo odrzucenia korekty |
+| `fit_zatrzymany_limitem` | informacja, czy CatBoost zakończył fit przez limit czasu |
+
+`wartosc_przewidywana` jest finalną hybrydą/fallbackiem dla OOF i przyszłości, a
+`wartosc_model_pelny` finalną hybrydą modelu końcowego dla wszystkich technicznie
+obsługiwanych wierszy.
 
 ## Uruchomienie bezpośrednio z SQL Server
 
