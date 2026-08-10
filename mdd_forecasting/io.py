@@ -77,9 +77,12 @@ def read_energy_file(
     path: str | Path,
     sheet_regex: str = r"^Dane_\d+$",
     max_rows: int | None = None,
+    row_selection: str = "head",
 ) -> pd.DataFrame:
     """Czyta A:I pozycyjnie, ponieważ w źródle dwa nagłówki mają nazwę `Nazwa`."""
 
+    if row_selection not in {"head", "tail"}:
+        raise ValueError("row_selection musi mieć wartość 'head' albo 'tail'.")
     source = Path(path)
     suffix = source.suffix.lower()
     if suffix in {".csv", ".txt"}:
@@ -93,9 +96,13 @@ def read_energy_file(
             raise ValueError(
                 f"Plik energii ma {raw.shape[1]} kolumn, a potrzeba co najmniej 9 (A:I)."
             )
+        total_rows = len(frame)
         frame.insert(0, "source_row", np.arange(2, len(frame) + 2))
         frame.insert(0, "source_sheet", source.stem)
-        return frame.head(max_rows) if max_rows else frame
+        if max_rows:
+            frame = frame.tail(max_rows) if row_selection == "tail" else frame.head(max_rows)
+        frame.attrs["source_rows_total_estimate"] = total_rows
+        return frame
 
     if suffix not in {".xlsx", ".xlsm"}:
         raise ValueError("Dane energii muszą być plikiem CSV, XLSX albo XLSM.")
@@ -113,31 +120,68 @@ def read_energy_file(
             f"Nie znaleziono arkuszy pasujących do {sheet_regex!r}. Dostępne: {workbook.sheetnames}"
         )
 
+    total_rows_estimate = sum(
+        max(int(workbook[name].max_row or 1) - 1, 0) for name in selected_sheets
+    )
     frames: list[pd.DataFrame] = []
     rows_left = max_rows
     try:
-        for sheet_name in selected_sheets:
-            sheet = workbook[sheet_name]
-            values = sheet.iter_rows(min_row=2, max_col=len(ENERGY_COLUMNS), values_only=True)
-            if rows_left is not None:
-                limited = []
-                for row in values:
-                    if len(limited) >= rows_left:
-                        break
-                    limited.append(row)
-                values = limited
-            frame = _energy_frame_from_values(values, sheet_name)
-            frames.append(frame)
-            if rows_left is not None:
+        if row_selection == "tail" and rows_left is not None:
+            reversed_frames: list[pd.DataFrame] = []
+            for sheet_name in reversed(selected_sheets):
+                sheet = workbook[sheet_name]
+                last_row = int(sheet.max_row or 1)
+                available_rows = max(last_row - 1, 0)
+                if available_rows == 0:
+                    continue
+                take_rows = min(rows_left, available_rows)
+                start_row = max(2, last_row - take_rows + 1)
+                values = sheet.iter_rows(
+                    min_row=start_row,
+                    max_row=last_row,
+                    max_col=len(ENERGY_COLUMNS),
+                    values_only=True,
+                )
+                frame = _energy_frame_from_values(
+                    values, sheet_name, start_row=start_row
+                )
+                if len(frame) > rows_left:
+                    frame = frame.tail(rows_left)
+                reversed_frames.append(frame)
                 rows_left -= len(frame)
                 if rows_left <= 0:
                     break
+            frames = list(reversed(reversed_frames))
+        else:
+            for sheet_name in selected_sheets:
+                sheet = workbook[sheet_name]
+                values = sheet.iter_rows(
+                    min_row=2,
+                    max_col=len(ENERGY_COLUMNS),
+                    values_only=True,
+                )
+                if rows_left is not None:
+                    limited = []
+                    for row in values:
+                        if len(limited) >= rows_left:
+                            break
+                        limited.append(row)
+                    values = limited
+                frame = _energy_frame_from_values(values, sheet_name)
+                frames.append(frame)
+                if rows_left is not None:
+                    rows_left -= len(frame)
+                    if rows_left <= 0:
+                        break
     finally:
         workbook.close()
 
     if not frames:
-        return pd.DataFrame(columns=["source_sheet", "source_row", *ENERGY_COLUMNS])
-    return pd.concat(frames, ignore_index=True)
+        result = pd.DataFrame(columns=["source_sheet", "source_row", *ENERGY_COLUMNS])
+    else:
+        result = pd.concat(frames, ignore_index=True)
+    result.attrs["source_rows_total_estimate"] = total_rows_estimate
+    return result
 
 
 def normalize_energy(
@@ -483,8 +527,43 @@ def prepare_energy_dataset(
     """Czyta i normalizuje energię przed zapytaniem SQL zależnym od zakresu dat."""
 
     branch_mapping, mapping_df = load_branch_mapping(config.mapping_path)
-    energy_raw = read_energy_file(energy_path, max_rows=max_rows)
+    energy_raw = read_energy_file(
+        energy_path,
+        max_rows=max_rows,
+        row_selection=config.input_row_selection,
+    )
+    source_rows_total = int(
+        energy_raw.attrs.get("source_rows_total_estimate", len(energy_raw))
+    )
     energy, energy_quality = normalize_energy(energy_raw, branch_mapping)
+    selected_dates = pd.to_datetime(energy["doba_handlowa"], errors="coerce").dropna()
+    selected_from = (
+        selected_dates.min().date().isoformat() if not selected_dates.empty else "brak"
+    )
+    selected_to = (
+        selected_dates.max().date().isoformat() if not selected_dates.empty else "brak"
+    )
+    input_limit_quality = pd.DataFrame(
+        [
+            [
+                "wiersze_zrodla_szacowane",
+                source_rows_total,
+                "na podstawie rozmiaru arkuszy",
+            ],
+            ["wiersze_uzyte_po_limicie", len(energy), config.input_row_selection],
+            [
+                "wiersze_pominiete_przez_limit",
+                max(source_rows_total - len(energy), 0),
+                "profil szybki świadomie używa najnowszego wycinka",
+            ],
+            ["zakres_wycinka_od", 0, selected_from],
+            ["zakres_wycinka_do", 0, selected_to],
+        ],
+        columns=["kontrola", "liczba", "szczegoly"],
+    )
+    energy_quality = pd.concat(
+        [energy_quality, input_limit_quality], ignore_index=True
+    )
     return energy, energy_quality, mapping_df
 
 

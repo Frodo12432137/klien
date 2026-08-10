@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -17,6 +18,20 @@ class ForecastResult:
     feature_importance: pd.DataFrame
     models: dict[str, Any]
     feature_spec: FeatureSpec
+
+
+class _CatBoostTimeLimit:
+    """Kończy fit po najbliższej iteracji po przekroczeniu limitu czasu."""
+
+    def __init__(self, seconds: float):
+        self.deadline = time.monotonic() + float(seconds)
+        self.stopped_by_time = False
+
+    def after_iteration(self, _info) -> bool:
+        if time.monotonic() >= self.deadline:
+            self.stopped_by_time = True
+            return False
+        return True
 
 
 def _sklearn_components():
@@ -61,7 +76,11 @@ def _make_model(spec: FeatureSpec, config: PipelineConfig):
             random_seed=config.random_state,
             cat_features=spec.categorical,
             allow_writing_files=False,
-            verbose=False,
+            verbose=(
+                config.model_progress_interval
+                if config.model_progress_interval > 0
+                else False
+            ),
             thread_count=-1,
         )
     if config.model_backend != "hist_gradient_boosting":
@@ -140,7 +159,13 @@ def _expanding_splits(frame: pd.DataFrame, config: PipelineConfig) -> list[tuple
 def _fit_log_model(train: pd.DataFrame, spec: FeatureSpec, config: PipelineConfig):
     model = _make_model(spec, config)
     y = np.log1p(train["wartosc_rzeczywista"].clip(lower=0).astype(float))
-    model.fit(train[spec.all], y)
+    time_limit = None
+    if config.model_backend == "catboost" and config.max_fit_seconds is not None:
+        time_limit = _CatBoostTimeLimit(config.max_fit_seconds)
+        model.fit(train[spec.all], y, callbacks=[time_limit])
+    else:
+        model.fit(train[spec.all], y)
+    setattr(model, "_mdd_stopped_by_time", bool(time_limit and time_limit.stopped_by_time))
     return model
 
 
@@ -245,7 +270,11 @@ def _baseline_for_fold(train: pd.DataFrame, test: pd.DataFrame) -> pd.Series:
     return baseline.fillna(fallback).fillna(global_median).clip(lower=0)
 
 
-def run_forecasting(frame: pd.DataFrame, config: PipelineConfig) -> ForecastResult:
+def run_forecasting(
+    frame: pd.DataFrame,
+    config: PipelineConfig,
+    progress_callback: Callable[[str], None] | None = None,
+) -> ForecastResult:
     """Uruchamia expanding-window backtest i dopasowuje modele końcowe.
 
     `wartosc_przewidywana` zawiera wyłącznie predykcje out-of-time oraz przyszłe.
@@ -253,7 +282,14 @@ def run_forecasting(frame: pd.DataFrame, config: PipelineConfig) -> ForecastResu
     jest in-sample i nie może służyć do oceny jakości.
     """
 
+    def progress(message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(message)
+
+    progress("Tworzę kalendarz i 12 lagów D-3...D-14...")
+    feature_started = time.monotonic()
     df, spec = build_features(frame, lag_days=config.lag_days)
+    progress(f"Cechy gotowe po {time.monotonic() - feature_started:.1f} s.")
     actual_times = pd.to_datetime(
         df.loc[df["wartosc_rzeczywista"].notna(), "model_timestamp_utc"],
         errors="coerce",
@@ -306,7 +342,21 @@ def run_forecasting(frame: pd.DataFrame, config: PipelineConfig) -> ForecastResu
             if len(train) < config.min_train_rows or len(test) == 0:
                 continue
 
+            fit_started = time.monotonic()
+            progress(
+                f"Backtest {fold_no}/{len(splits)}, {direction}: "
+                f"uczę na {len(train):,} wierszach..."
+            )
             model = _fit_log_model(train, spec, config)
+            progress(
+                f"Backtest {fold_no}/{len(splits)}, {direction}: gotowe po "
+                f"{time.monotonic() - fit_started:.1f} s"
+                + (
+                    " (zatrzymano limitem czasu)."
+                    if getattr(model, "_mdd_stopped_by_time", False)
+                    else "."
+                )
+            )
             prediction = _predict_original_scale(model, test, spec)
             df.loc[test.index, "wartosc_przewidywana"] = prediction
             df.loc[test.index, "wartosc_bazowa_backtest"] = _baseline_for_fold(train, test)
@@ -353,7 +403,20 @@ def run_forecasting(frame: pd.DataFrame, config: PipelineConfig) -> ForecastResu
         predict_frame = df.loc[predict_mask]
         if len(train) < config.min_train_rows or predict_frame.empty:
             continue
+        fit_started = time.monotonic()
+        progress(
+            f"Model końcowy {direction}: uczę na {len(train):,} wierszach..."
+        )
         model = _fit_log_model(train, spec, config)
+        progress(
+            f"Model końcowy {direction}: gotowe po "
+            f"{time.monotonic() - fit_started:.1f} s"
+            + (
+                " (zatrzymano limitem czasu)."
+                if getattr(model, "_mdd_stopped_by_time", False)
+                else "."
+            )
+        )
         models[direction] = model
         full_prediction = _predict_original_scale(model, predict_frame, spec)
         df.loc[predict_frame.index, "wartosc_model_pelny"] = full_prediction

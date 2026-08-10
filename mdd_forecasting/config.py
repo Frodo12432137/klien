@@ -95,6 +95,8 @@ class PipelineConfig:
 
     min_lead_hours: int = 24
     weather_available_from: str = "2024-10-01"
+    execution_profile: str = "standard"
+    input_row_selection: str = "head"
     lag_days: tuple[int, ...] = tuple(range(3, 15))
     timezone: str = "Europe/Warsaw"
     validation_days: int = 14
@@ -105,6 +107,8 @@ class PipelineConfig:
     learning_rate: float = 0.06
     model_backend: str = "hist_gradient_boosting"
     catboost_depth: int = 8
+    max_fit_seconds: float | None = None
+    model_progress_interval: int = 0
     random_state: int = 42
     compute_importance: bool = True
     max_importance_rows: int = 5_000

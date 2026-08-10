@@ -138,6 +138,12 @@ python -m mdd_forecasting `
 `--weather-sql` i `--weather` są wzajemnie wykluczające. Ten sam model można więc
 uruchomić bez bazy na wcześniej wyeksportowanym CSV.
 
+Launcher `uruchom_model.py` korzysta z profilu szybkiego: zakres SQL wynika wyłącznie
+z najnowszych 150 000 wierszy energii, timeout połączenia wynosi 15 sekund, a timeout
+zapytania 300 sekund. Terminal pokazuje osobne komunikaty przed i po SQL wraz z liczbą
+pobranych rekordów. Ostrzeżenie pandas o bezpośrednim połączeniu DBAPI2 jest ukryte,
+ponieważ użycie pyodbc jest tutaj zamierzone i przetestowane.
+
 ## Szyfrowanie i sterownik
 
 Jeśli firmowy SQL Server ma poprawny certyfikat, należy dodać `--sql-encrypt`.
