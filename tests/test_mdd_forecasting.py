@@ -116,6 +116,40 @@ class TestMddForecasting(unittest.TestCase):
         self.assertEqual(len(params), 5)
         self.assertEqual(params[2:], [24, "PGESA", "Open Meteo"])
 
+    def test_plain_sql_without_placeholders_is_supported(self):
+        class FakeConnection:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        connection = FakeConnection()
+        fake_pyodbc = SimpleNamespace(
+            drivers=lambda: ["ODBC Driver 17 for SQL Server"],
+            connect=lambda *args, **kwargs: connection,
+        )
+        expected = pd.DataFrame({"punkt": ["Łódź"]})
+        with tempfile.TemporaryDirectory() as tmp:
+            sql_path = Path(tmp) / "firmowy.sql"
+            sql_path.write_text(
+                "DECLARE @data_start date = '2025-01-01'; SELECT 'Łódź' AS punkt;",
+                encoding="utf-8",
+            )
+            with patch.dict("sys.modules", {"pyodbc": fake_pyodbc}), patch(
+                "mdd_forecasting.database.pd.read_sql_query", return_value=expected
+            ) as read_query, self.assertWarnsRegex(UserWarning, "bez zmian"):
+                result = query_weather_sql(
+                    sql_path,
+                    settings=SqlServerSettings(),
+                    valid_from_cet="2025-01-01",
+                    valid_to_cet_exclusive="2025-01-03",
+                    min_lead_hours=24,
+                )
+        self.assertEqual(result.to_dict("records"), [{"punkt": "Łódź"}])
+        self.assertTrue(connection.closed)
+        self.assertNotIn("params", read_query.call_args.kwargs)
+
     def test_sql_range_is_inferred_from_energy_dates(self):
         energy = pd.DataFrame(
             {"doba_handlowa": ["2025-01-05", "2025-01-07", None]}

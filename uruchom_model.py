@@ -118,11 +118,12 @@ def main() -> int:
                 parent=root,
             )
             return 1
-        except Exception:
+        except Exception as exc:
             log_path = _write_error_log(Path(output))
             messagebox.showerror(
                 "Model zakończył się błędem",
-                "Szczegóły zapisano w pliku:\n"
+                f"Przyczyna:\n{type(exc).__name__}: {exc}\n\n"
+                "Pełne szczegóły zapisano w pliku:\n"
                 f"{log_path}\n\nWyślij ten plik przy zgłaszaniu problemu.",
                 parent=root,
             )

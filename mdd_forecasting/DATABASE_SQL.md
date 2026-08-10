@@ -60,6 +60,22 @@ validToCETExclusive = max(Doba Handlowa) + 1 dzień
 
 Można go nadpisać opcjami `--valid-from` i `--valid-to-exclusive`.
 
+### Zwykły firmowy SQL bez `?`
+
+Program obsługuje również plik SQL, który nie ma żadnych placeholderów `?` i sam
+ustawia zmienne przez `DECLARE`, np. `@data_start` i `@data_stop`. Taki plik jest
+wykonywany dokładnie w zapisanej postaci. Wtedy program nie może automatycznie
+przekazać zakresu z Excela ani `minLeadHours`, dlatego kwerenda musi samodzielnie:
+
+- ustawić właściwy zakres dat;
+- zwrócić wymagane kolumny `punkt` i `dataGodzinaCET`;
+- najlepiej zwrócić również `czasDanychZrodlaCET/UTC`, aby Python mógł sprawdzić
+  historyczny vintage bez leakage.
+
+Obsługiwane są zatem dwa kontrakty: dokładnie **5** placeholderów dla wersji
+parametryzowanej albo dokładnie **0** dla samodzielnego zwykłego SQL-a. Inna liczba
+jest traktowana jako niekompletna kwerenda i kończy się czytelnym błędem.
+
 ## Co robi kwerenda
 
 1. Czyta sześć punktów: Białystok, Lublin, Łódź, Rzeszów, Zamość i
