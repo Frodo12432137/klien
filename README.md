@@ -10,6 +10,26 @@ Modele są globalne, czyli uczą się na wszystkich klientach, ale nazwa klienta
 oddział, miasto i kierunek pozostają cechami. To stabilniejsze niż osobny model dla
 każdej nazwy: mały klient może skorzystać z prawidłowości poznanych na całym zbiorze.
 
+## Uruchomienie strzałką ▶ w VS Code
+
+Na komputerze służbowym nie trzeba wpisywać żadnych ścieżek do kodu:
+
+1. Otwórz w VS Code cały folder repozytorium `klien`.
+2. Jednorazowo zainstaluj biblioteki:
+
+   ```powershell
+   python -m pip install -r mdd_forecasting\requirements-production.txt
+   ```
+
+3. Otwórz główny plik `uruchom_model.py`.
+4. Kliknij strzałkę **Run Python File** ▶ w prawym górnym rogu.
+5. W pierwszym oknie wybierz Excel energii, a w drugim katalog wynikowy.
+6. Potwierdź uruchomienie. Po zakończeniu program pokaże lokalizację
+   `wyniki_mdd.xlsx` i zaproponuje otwarcie folderu.
+
+Launcher zawsze odnajduje SQL względem folderu repozytorium, używa CatBoost,
+`min-lead-hours=24` i nie przechowuje żadnej prywatnej ani służbowej ścieżki.
+
 ## Ziarno danych i mapowanie
 
 Jedna obserwacja modelu to jeden oryginalny wiersz Excela. Arkusze `Dane_01`,
