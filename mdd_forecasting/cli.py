@@ -61,6 +61,36 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--validation-days", type=int, default=14)
     parser.add_argument("--folds", type=int, default=3)
+    parser.add_argument(
+        "--calibration-days",
+        type=int,
+        default=7,
+        help=(
+            "Liczba najnowszych dni historii przed oknem OOF używanych do "
+            "kalibracji blendu z baseline."
+        ),
+    )
+    parser.add_argument(
+        "--min-calibration-rows",
+        type=int,
+        default=200,
+        help="Minimalna liczba rekordów kalibracyjnych osobno dla kierunku.",
+    )
+    parser.add_argument(
+        "--min-blend-improvement",
+        type=float,
+        default=0.02,
+        help=(
+            "Minimalna względna poprawa MAE względem baseline wymagana do włączenia "
+            "korekty ML (domyślnie 0.02 = 2%%)."
+        ),
+    )
+    parser.add_argument(
+        "--blend-grid-steps",
+        type=int,
+        default=21,
+        help="Liczba sprawdzanych wartości alpha blendu w przedziale 0..1.",
+    )
     parser.add_argument("--min-train-rows", type=int, default=200)
     parser.add_argument("--max-train-rows", type=int, default=1_000_000)
     parser.add_argument("--max-iter", type=int, default=220)
@@ -128,6 +158,19 @@ def _write_csv(frame: pd.DataFrame, path: Path) -> None:
 
 
 def _prediction_columns(frame: pd.DataFrame, compact: bool = False) -> list[str]:
+    hybrid_audit = [
+        "wartosc_bazowa_backtest",
+        "liczba_lagow_bazowych",
+        "residuum_rzeczywiste",
+        "korekta_ml_surowa",
+        "wartosc_ml_przed_blendem",
+        "blend_alpha",
+        "strategia_predykcji",
+        "kalibracja_n",
+        "kalibracja_poprawa_mae",
+        "kalibracja_powod",
+        "fit_zatrzymany_limitem",
+    ]
     if compact:
         preferred = [
             "source_sheet",
@@ -141,7 +184,7 @@ def _prediction_columns(frame: pd.DataFrame, compact: bool = False) -> list[str]
             "godzina_handlowa",
             "wartosc_rzeczywista",
             "wartosc_przewidywana",
-            "wartosc_bazowa_backtest",
+            *hybrid_audit,
             "blad",
             "blad_bezwzgledny",
             "status_predykcji",
@@ -171,7 +214,7 @@ def _prediction_columns(frame: pd.DataFrame, compact: bool = False) -> list[str]
         "rodzaj",
         "wartosc_rzeczywista",
         "wartosc_przewidywana",
-        "wartosc_bazowa_backtest",
+        *hybrid_audit,
         "wartosc_model_pelny",
         "model_pelny_jest_insample",
         "blad",
@@ -196,6 +239,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     positive = {
         "--validation-days": args.validation_days,
         "--folds": args.folds,
+        "--calibration-days": args.calibration_days,
+        "--min-calibration-rows": args.min_calibration_rows,
         "--min-train-rows": args.min_train_rows,
         "--max-train-rows": args.max_train_rows,
         "--max-iter": args.max_iter,
@@ -214,6 +259,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--sql-query-timeout nie może być ujemny.")
     if args.model_progress_interval < 0:
         raise ValueError("--model-progress-interval nie może być ujemny.")
+    if not 0 <= args.min_blend_improvement < 1:
+        raise ValueError("--min-blend-improvement musi należeć do przedziału [0, 1).")
+    if args.blend_grid_steps < 2:
+        raise ValueError("--blend-grid-steps musi wynosić co najmniej 2.")
 
 
 def _infer_sql_date_range(
@@ -270,6 +319,10 @@ def main(argv: list[str] | None = None) -> int:
         input_row_selection=args.input_row_selection,
         validation_days=args.validation_days,
         n_splits=args.folds,
+        calibration_days=args.calibration_days,
+        min_calibration_rows=args.min_calibration_rows,
+        min_blend_improvement=args.min_blend_improvement,
+        blend_grid_steps=args.blend_grid_steps,
         min_train_rows=args.min_train_rows,
         max_train_rows=args.max_train_rows,
         max_iter=args.max_iter,
@@ -417,6 +470,35 @@ def main(argv: list[str] | None = None) -> int:
     result = run_forecasting(joined, config, progress_callback=progress)
     progress("Uczenie i predykcja zakończone.")
     predictions = result.predictions
+    hybrid_quality_rows: list[list[object]] = []
+    for direction, artifact in sorted(result.models.items()):
+        alpha = getattr(artifact, "alpha", None)
+        if alpha is None:
+            # Zgodność z artefaktami starszego modelu: raport nie zależy twardo od
+            # klasy HybridModelArtifact ani nie próbuje zgadywać parametrów.
+            continue
+        calibration_n = int(getattr(artifact, "calibration_n", 0) or 0)
+        improvement = getattr(artifact, "calibration_improvement", None)
+        reason = str(getattr(artifact, "calibration_reason", "BRAK_INFORMACJI"))
+        target = str(getattr(artifact, "target", "residuum_wzgledem_D3_D14"))
+        estimator = getattr(artifact, "estimator", artifact)
+        stopped_by_time = bool(getattr(estimator, "_mdd_stopped_by_time", False))
+        improvement_text = (
+            "brak"
+            if improvement is None or pd.isna(improvement)
+            else f"{float(improvement):.2%}"
+        )
+        hybrid_quality_rows.append(
+            [
+                f"hybryda_kalibracja_{str(direction).lower()}",
+                calibration_n,
+                (
+                    f"alpha={float(alpha):.3f}; poprawa_MAE={improvement_text}; "
+                    f"decyzja={reason}; target={target}; "
+                    f"fit_zatrzymany_limitem={stopped_by_time}"
+                ),
+            ]
+        )
     model_quality = pd.DataFrame(
         [
             ["wiersze_OOF_do_oceny", int(predictions["status_predykcji"].eq("OOF_BACKTEST").sum()), ""],
@@ -433,6 +515,7 @@ def main(argv: list[str] | None = None) -> int:
             ["historyczne_braki_targetu", int(predictions["status_predykcji"].eq("HISTORYCZNY_BRAK_TARGETU").sum()), "nie są oznaczane jako prognoza przyszła"],
             ["wiersze_warmup_bez_OOF", int(predictions["status_predykcji"].eq("WARMUP_BEZ_OOF").sum()), ""],
             ["modele_koncowe", len(result.models), ", ".join(sorted(result.models))],
+            *hybrid_quality_rows,
         ],
         columns=["kontrola", "liczba", "szczegoly"],
     )
@@ -466,8 +549,11 @@ def main(argv: list[str] | None = None) -> int:
         "categorical_features": result.feature_spec.categorical,
         "numeric_features": result.feature_spec.numeric,
         "note": (
-            "Metryki wykorzystują wyłącznie status OOF_BACKTEST. Kolumna wartosc_model_pelny "
-            "dla rekordów historycznych jest in-sample i nie służy do oceny."
+            "Metryki HYBRYDA_OOF wykorzystują wyłącznie predykcje poza próbą. "
+            "Korekta residualna jest dodawana do baseline D-3...D-14 tylko po "
+            "potwierdzeniu minimalnej poprawy na kalibracji; w przeciwnym razie "
+            "alpha=0 oznacza bezpieczny fallback do baseline. Kolumna "
+            "wartosc_model_pelny dla historii jest in-sample i nie służy do oceny."
         ),
     }
     (output_dir / "manifest.json").write_text(

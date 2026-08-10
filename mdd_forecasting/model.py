@@ -20,6 +20,26 @@ class ForecastResult:
     feature_spec: FeatureSpec
 
 
+@dataclass(frozen=True)
+class BlendSelection:
+    alpha: float
+    n: int
+    baseline_mae: float
+    hybrid_mae: float
+    improvement: float
+    reason: str
+
+
+@dataclass
+class HybridModelArtifact:
+    estimator: Any
+    alpha: float
+    calibration_n: int
+    calibration_improvement: float
+    calibration_reason: str
+    target: str = "residuum_wzgledem_D3_D14"
+
+
 class _CatBoostTimeLimit:
     """Kończy fit po najbliższej iteracji po przekroczeniu limitu czasu."""
 
@@ -67,7 +87,9 @@ def _make_model(spec: FeatureSpec, config: PipelineConfig):
                 "python -m pip install -r mdd_forecasting/requirements-production.txt"
             ) from exc
         return CatBoostRegressor(
-            loss_function="RMSE",
+            # Model uczy korektę do mocnego baseline. MAE jest odporniejsze na
+            # pojedyncze skoki niż RMSE i nie wymaga log1p, które zaniżało wolumen.
+            loss_function="MAE",
             eval_metric="MAE",
             iterations=config.max_iter,
             depth=config.catboost_depth,
@@ -122,7 +144,7 @@ def _make_model(spec: FeatureSpec, config: PipelineConfig):
         verbose_feature_names_out=False,
     )
     regressor = HistGradientBoostingRegressor(
-        loss="squared_error",
+        loss="absolute_error",
         learning_rate=config.learning_rate,
         max_iter=config.max_iter,
         max_leaf_nodes=31,
@@ -156,22 +178,116 @@ def _expanding_splits(frame: pd.DataFrame, config: PipelineConfig) -> list[tuple
     return [(first_start + fold * window, first_start + (fold + 1) * window) for fold in range(config.n_splits)]
 
 
-def _fit_log_model(train: pd.DataFrame, spec: FeatureSpec, config: PipelineConfig):
+def _fit_residual_model(
+    train: pd.DataFrame, spec: FeatureSpec, config: PipelineConfig
+):
+    usable = train[
+        train["wartosc_rzeczywista"].notna()
+        & train["wartosc_bazowa"].notna()
+    ]
+    if len(usable) < config.min_train_rows:
+        raise ValueError(
+            "Za mało wierszy z naturalnym baseline D-3...D-14 do uczenia korekty."
+        )
     model = _make_model(spec, config)
-    y = np.log1p(train["wartosc_rzeczywista"].clip(lower=0).astype(float))
+    y = (
+        usable["wartosc_rzeczywista"].astype(float)
+        - usable["wartosc_bazowa"].astype(float)
+    )
     time_limit = None
     if config.model_backend == "catboost" and config.max_fit_seconds is not None:
         time_limit = _CatBoostTimeLimit(config.max_fit_seconds)
-        model.fit(train[spec.all], y, callbacks=[time_limit])
+        model.fit(usable[spec.all], y, callbacks=[time_limit])
     else:
-        model.fit(train[spec.all], y)
+        model.fit(usable[spec.all], y)
     setattr(model, "_mdd_stopped_by_time", bool(time_limit and time_limit.stopped_by_time))
     return model
 
 
-def _predict_original_scale(model, frame: pd.DataFrame, spec: FeatureSpec) -> np.ndarray:
-    log_prediction = model.predict(frame[spec.all])
-    return np.expm1(log_prediction).clip(min=0)
+def _predict_residual_correction(
+    model, frame: pd.DataFrame, spec: FeatureSpec
+) -> np.ndarray:
+    return np.asarray(model.predict(frame[spec.all]), dtype=float)
+
+
+def _blend_prediction(
+    baseline: pd.Series | np.ndarray,
+    correction: pd.Series | np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    baseline_np = np.asarray(baseline, dtype=float)
+    correction_np = np.asarray(correction, dtype=float)
+    return np.clip(baseline_np + float(alpha) * correction_np, 0.0, None)
+
+
+def _select_blend_alpha(
+    actual: pd.Series | np.ndarray,
+    baseline: pd.Series | np.ndarray,
+    correction: pd.Series | np.ndarray,
+    *,
+    min_rows: int,
+    min_improvement: float,
+    grid_steps: int,
+) -> BlendSelection:
+    actual_np = np.asarray(actual, dtype=float)
+    baseline_np = np.asarray(baseline, dtype=float)
+    correction_np = np.asarray(correction, dtype=float)
+    mask = (
+        np.isfinite(actual_np)
+        & np.isfinite(baseline_np)
+        & np.isfinite(correction_np)
+    )
+    actual_np = actual_np[mask]
+    baseline_np = baseline_np[mask]
+    correction_np = correction_np[mask]
+    n = int(len(actual_np))
+    if n < int(min_rows):
+        return BlendSelection(0.0, n, np.nan, np.nan, 0.0, "ZA_MALO_KALIBRACJI")
+
+    baseline_prediction = np.clip(baseline_np, 0.0, None)
+    baseline_mae = float(np.mean(np.abs(baseline_prediction - actual_np)))
+    if not np.isfinite(baseline_mae) or baseline_mae <= 0:
+        return BlendSelection(
+            0.0,
+            n,
+            baseline_mae,
+            baseline_mae,
+            0.0,
+            "BASELINE_IDEALNY_LUB_NIEPOPRAWNY",
+        )
+
+    steps = max(int(grid_steps), 2)
+    alphas = np.linspace(0.0, 1.0, steps)
+    maes = np.asarray(
+        [
+            np.mean(
+                np.abs(_blend_prediction(baseline_np, correction_np, alpha) - actual_np)
+            )
+            for alpha in alphas
+        ],
+        dtype=float,
+    )
+    best_index = int(np.nanargmin(maes))
+    best_alpha = float(alphas[best_index])
+    best_mae = float(maes[best_index])
+    improvement = float((baseline_mae - best_mae) / baseline_mae)
+    if best_alpha <= 0 or improvement < float(min_improvement):
+        return BlendSelection(
+            0.0,
+            n,
+            baseline_mae,
+            baseline_mae,
+            max(improvement, 0.0),
+            "BRAK_POTWIERDZONEJ_POPRAWY",
+        )
+    return BlendSelection(
+        best_alpha,
+        n,
+        baseline_mae,
+        best_mae,
+        improvement,
+        "HYBRYDA_WYBRANA",
+    )
 
 
 def _safe_metric_values(actual: pd.Series, predicted: pd.Series) -> tuple[np.ndarray, np.ndarray]:
@@ -258,16 +374,65 @@ def _metrics_by_scope(frame: pd.DataFrame, prediction_col: str, model_name: str)
 
 
 def _baseline_for_fold(train: pd.DataFrame, test: pd.DataFrame) -> pd.Series:
-    baseline = test["wartosc_bazowa"].copy()
-    medians = train.groupby(
-        ["klient_nazwa", "kierunek_energii_norm", "godzina"], dropna=False
-    )["wartosc_rzeczywista"].median()
-    keys = pd.MultiIndex.from_frame(
-        test[["klient_nazwa", "kierunek_energii_norm", "godzina"]]
+    """Baseline bez leakage: naturalne lagi, potem mediany tylko z prefiksu train."""
+
+    baseline = pd.to_numeric(test["wartosc_bazowa"], errors="coerce").copy()
+    usable_train = train[train["wartosc_rzeczywista"].notna()]
+
+    def grouped_fallback(columns: list[str]) -> pd.Series:
+        medians = usable_train.groupby(columns, dropna=False)[
+            "wartosc_rzeczywista"
+        ].median()
+        keys = pd.MultiIndex.from_frame(test[columns])
+        values = medians.reindex(keys).to_numpy()
+        return pd.Series(values, index=test.index, dtype=float)
+
+    # Kolejność jest celowa: najpierw profil konkretnego klienta, później coraz
+    # szersze grupy. Prawidłowe zero (np. PV nocą) nigdy nie jest traktowane jak brak.
+    for columns in (
+        ["klient_nazwa", "kierunek_energii_norm", "godzina"],
+        ["oddzial_code", "kierunek_energii_norm", "godzina"],
+        ["kierunek_energii_norm", "godzina"],
+    ):
+        baseline = baseline.fillna(grouped_fallback(columns))
+
+    direction_median = usable_train.groupby("kierunek_energii_norm", dropna=False)[
+        "wartosc_rzeczywista"
+    ].median()
+    baseline = baseline.fillna(test["kierunek_energii_norm"].map(direction_median))
+    global_median = pd.to_numeric(
+        usable_train["wartosc_rzeczywista"], errors="coerce"
+    ).median()
+    if pd.isna(global_median):
+        global_median = 0.0
+    return baseline.fillna(float(global_median)).clip(lower=0).astype(float)
+
+
+def _split_calibration_window(
+    train: pd.DataFrame,
+    validation_start: pd.Timestamp,
+    config: PipelineConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Rozdziela prefiks na uczenie i późniejszą kalibrację alfy."""
+
+    calibration_start = validation_start - pd.Timedelta(days=config.calibration_days)
+    timestamps = pd.to_datetime(train["model_timestamp_utc"], errors="coerce", utc=True)
+    fit = train.loc[timestamps.lt(calibration_start)]
+    calibration = train.loc[
+        timestamps.ge(calibration_start) & timestamps.lt(validation_start)
+    ]
+    return fit, calibration
+
+
+def _fallback_selection(reason: str, n: int = 0) -> BlendSelection:
+    return BlendSelection(
+        alpha=0.0,
+        n=int(n),
+        baseline_mae=np.nan,
+        hybrid_mae=np.nan,
+        improvement=0.0,
+        reason=reason,
     )
-    fallback = pd.Series(medians.reindex(keys).to_numpy(), index=test.index)
-    global_median = float(train["wartosc_rzeczywista"].median())
-    return baseline.fillna(fallback).fillna(global_median).clip(lower=0)
 
 
 def run_forecasting(
@@ -275,11 +440,11 @@ def run_forecasting(
     config: PipelineConfig,
     progress_callback: Callable[[str], None] | None = None,
 ) -> ForecastResult:
-    """Uruchamia expanding-window backtest i dopasowuje modele końcowe.
+    """Uruchamia uczciwy backtest hybrydy baseline + korekta residualna.
 
-    `wartosc_przewidywana` zawiera wyłącznie predykcje out-of-time oraz przyszłe.
-    `wartosc_model_pelny` daje techniczną predykcję dla każdego wiersza, ale dla historii
-    jest in-sample i nie może służyć do oceny jakości.
+    Model residualny nie zastępuje średniej D-3...D-14. Uczy się jedynie jej
+    poprawki, a udział poprawki (`alpha`) jest wybierany na oknie kalibracyjnym
+    wcześniejszym od ocenianego OOF. Brak potwierdzonej poprawy oznacza alpha=0.
     """
 
     def progress(message: str) -> None:
@@ -290,6 +455,7 @@ def run_forecasting(
     feature_started = time.monotonic()
     df, spec = build_features(frame, lag_days=config.lag_days)
     progress(f"Cechy gotowe po {time.monotonic() - feature_started:.1f} s.")
+
     actual_times = pd.to_datetime(
         df.loc[df["wartosc_rzeczywista"].notna(), "model_timestamp_utc"],
         errors="coerce",
@@ -299,16 +465,37 @@ def run_forecasting(
     missing_target = df["wartosc_rzeczywista"].isna()
     valid_model_time = df["model_timestamp_utc"].notna()
     if pd.notna(forecast_cutoff):
-        future_mask = missing_target & valid_model_time & df["model_timestamp_utc"].gt(forecast_cutoff)
+        future_mask = (
+            missing_target
+            & valid_model_time
+            & df["model_timestamp_utc"].gt(forecast_cutoff)
+        )
         historical_gap_mask = (
-            missing_target & valid_model_time & df["model_timestamp_utc"].le(forecast_cutoff)
+            missing_target
+            & valid_model_time
+            & df["model_timestamp_utc"].le(forecast_cutoff)
         )
     else:
         future_mask = pd.Series(False, index=df.index)
         historical_gap_mask = missing_target & valid_model_time
-    df["wartosc_przewidywana"] = np.nan
-    df["wartosc_bazowa_backtest"] = np.nan
-    df["wartosc_model_pelny"] = np.nan
+
+    for column in (
+        "wartosc_przewidywana",
+        "wartosc_bazowa_backtest",
+        "wartosc_model_pelny",
+        "residuum_rzeczywiste",
+        "korekta_ml_surowa",
+        "wartosc_ml_przed_blendem",
+        "blend_alpha",
+        "kalibracja_poprawa_mae",
+    ):
+        df[column] = np.nan
+    df["kalibracja_n"] = pd.Series(pd.NA, index=df.index, dtype="Int64")
+    df["strategia_predykcji"] = pd.Series(pd.NA, index=df.index, dtype="string")
+    df["kalibracja_powod"] = pd.Series(pd.NA, index=df.index, dtype="string")
+    df["fit_zatrzymany_limitem"] = pd.Series(
+        pd.NA, index=df.index, dtype="boolean"
+    )
     df["prognoza_bez_pogody"] = False
     df["fold"] = pd.Series(pd.NA, index=df.index, dtype="Int64")
     df["status_predykcji"] = "WARMUP_BEZ_OOF"
@@ -320,7 +507,9 @@ def run_forecasting(
     directions = ["POBRANIE", "ODDANIE"]
     importances: list[dict[str, Any]] = []
     splits = _expanding_splits(df, config)
-    _, _, permutation_importance, _, _, _ = _sklearn_components()
+    permutation_importance = None
+    if config.compute_importance:
+        _, _, permutation_importance, _, _, _ = _sklearn_components()
 
     for fold_no, (validation_start, validation_end) in enumerate(splits, start=1):
         for direction in directions:
@@ -337,39 +526,116 @@ def run_forecasting(
                 & df["model_timestamp_utc"].ge(validation_start)
                 & df["model_timestamp_utc"].lt(validation_end)
             )
-            train = _cap_training(df.loc[train_mask], config.max_train_rows)
+            history = df.loc[train_mask]
             test = df.loc[test_mask]
-            if len(train) < config.min_train_rows or len(test) == 0:
+            if len(history) < config.min_train_rows or test.empty:
                 continue
 
-            fit_started = time.monotonic()
-            progress(
-                f"Backtest {fold_no}/{len(splits)}, {direction}: "
-                f"uczę na {len(train):,} wierszach..."
+            baseline_test = _baseline_for_fold(history, test)
+            fit_prefix, calibration = _split_calibration_window(
+                history, validation_start, config
             )
-            model = _fit_log_model(train, spec, config)
-            progress(
-                f"Backtest {fold_no}/{len(splits)}, {direction}: gotowe po "
-                f"{time.monotonic() - fit_started:.1f} s"
-                + (
-                    " (zatrzymano limitem czasu)."
-                    if getattr(model, "_mdd_stopped_by_time", False)
-                    else "."
+            fit_train = _cap_training(fit_prefix, config.max_train_rows)
+            usable_fit_rows = int(
+                (
+                    fit_train["wartosc_rzeczywista"].notna()
+                    & fit_train["wartosc_bazowa"].notna()
+                ).sum()
+            )
+            model = None
+            correction_test = np.zeros(len(test), dtype=float)
+            selection = _fallback_selection("ZA_MALO_DANYCH_DO_MODELU")
+            stopped_by_time = False
+
+            if usable_fit_rows >= config.min_train_rows:
+                fit_started = time.monotonic()
+                progress(
+                    f"Backtest {fold_no}/{len(splits)}, {direction}: uczę korektę "
+                    f"na {usable_fit_rows:,} wierszach; kalibracja {len(calibration):,}..."
                 )
+                model = _fit_residual_model(fit_train, spec, config)
+                stopped_by_time = bool(
+                    getattr(model, "_mdd_stopped_by_time", False)
+                )
+                progress(
+                    f"Backtest {fold_no}/{len(splits)}, {direction}: gotowe po "
+                    f"{time.monotonic() - fit_started:.1f} s"
+                    + (
+                        " (zatrzymano limitem czasu)."
+                        if stopped_by_time
+                        else "."
+                    )
+                )
+                if not calibration.empty:
+                    calibration_baseline = _baseline_for_fold(
+                        fit_prefix, calibration
+                    )
+                    calibration_correction = _predict_residual_correction(
+                        model, calibration, spec
+                    )
+                    selection = _select_blend_alpha(
+                        calibration["wartosc_rzeczywista"],
+                        calibration_baseline,
+                        calibration_correction,
+                        min_rows=config.min_calibration_rows,
+                        min_improvement=config.min_blend_improvement,
+                        grid_steps=config.blend_grid_steps,
+                    )
+                else:
+                    selection = _fallback_selection("BRAK_OKNA_KALIBRACYJNEGO")
+                correction_test = _predict_residual_correction(model, test, spec)
+            else:
+                progress(
+                    f"Backtest {fold_no}/{len(splits)}, {direction}: za mało danych "
+                    "przed kalibracją — używam baseline."
+                )
+
+            raw_candidate = _blend_prediction(baseline_test, correction_test, 1.0)
+            prediction = _blend_prediction(
+                baseline_test, correction_test, selection.alpha
             )
-            prediction = _predict_original_scale(model, test, spec)
+            strategy = (
+                "HYBRYDA"
+                if selection.alpha > 0
+                else "BASELINE_FALLBACK"
+            )
             df.loc[test.index, "wartosc_przewidywana"] = prediction
-            df.loc[test.index, "wartosc_bazowa_backtest"] = _baseline_for_fold(train, test)
+            df.loc[test.index, "wartosc_bazowa_backtest"] = baseline_test
+            df.loc[test.index, "residuum_rzeczywiste"] = (
+                test["wartosc_rzeczywista"].astype(float).to_numpy()
+                - baseline_test.to_numpy(dtype=float)
+            )
+            df.loc[test.index, "korekta_ml_surowa"] = correction_test
+            df.loc[test.index, "wartosc_ml_przed_blendem"] = raw_candidate
+            df.loc[test.index, "blend_alpha"] = selection.alpha
+            df.loc[test.index, "strategia_predykcji"] = strategy
+            df.loc[test.index, "kalibracja_n"] = selection.n
+            df.loc[test.index, "kalibracja_poprawa_mae"] = selection.improvement
+            df.loc[test.index, "kalibracja_powod"] = selection.reason
+            df.loc[test.index, "fit_zatrzymany_limitem"] = stopped_by_time
             df.loc[test.index, "fold"] = fold_no
             df.loc[test.index, "status_predykcji"] = "OOF_BACKTEST"
 
-            # Permutacja na ograniczonej, chronologicznej próbce utrzymuje koszt pod kontrolą.
-            importance_test = test.sort_values("model_timestamp_utc").tail(config.max_importance_rows)
-            if config.compute_importance and len(importance_test) >= 50:
+            # Ważność dotyczy korekty residualnej, nie pełnego poziomu energii.
+            importance_test = (
+                test[test["wartosc_bazowa"].notna()]
+                .sort_values("model_timestamp_utc")
+                .tail(config.max_importance_rows)
+            )
+            if (
+                model is not None
+                and config.compute_importance
+                and len(importance_test) >= 50
+            ):
+                assert permutation_importance is not None
+                residual_target = (
+                    importance_test["wartosc_rzeczywista"].astype(float)
+                    - importance_test["wartosc_bazowa"].astype(float)
+                )
                 result = permutation_importance(
                     model,
                     importance_test[spec.all],
-                    np.log1p(importance_test["wartosc_rzeczywista"].clip(lower=0)),
+                    residual_target,
                     scoring="neg_mean_absolute_error",
                     n_repeats=2,
                     random_state=config.random_state,
@@ -383,7 +649,7 @@ def run_forecasting(
                             "kierunek": direction,
                             "fold": fold_no,
                             "cecha": feature,
-                            "waznosc_permutacyjna_log_mae": float(mean_value),
+                            "waznosc_permutacyjna_residuum_mae": float(mean_value),
                             "odchylenie": float(std_value),
                         }
                     )
@@ -396,35 +662,114 @@ def run_forecasting(
             & df["wartosc_rzeczywista"].ge(0)
             & df["model_timestamp_utc"].notna()
         )
-        train = _cap_training(df.loc[train_mask], config.max_train_rows)
-        predict_mask = df["kierunek_energii_norm"].eq(direction) & df[
-            "model_timestamp_utc"
-        ].notna()
+        history = df.loc[train_mask]
+        train = _cap_training(history, config.max_train_rows)
+        predict_mask = (
+            df["kierunek_energii_norm"].eq(direction)
+            & df["model_timestamp_utc"].notna()
+        )
         predict_frame = df.loc[predict_mask]
-        if len(train) < config.min_train_rows or predict_frame.empty:
+        if len(history) < config.min_train_rows or predict_frame.empty:
             continue
-        fit_started = time.monotonic()
-        progress(
-            f"Model końcowy {direction}: uczę na {len(train):,} wierszach..."
-        )
-        model = _fit_log_model(train, spec, config)
-        progress(
-            f"Model końcowy {direction}: gotowe po "
-            f"{time.monotonic() - fit_started:.1f} s"
-            + (
-                " (zatrzymano limitem czasu)."
-                if getattr(model, "_mdd_stopped_by_time", False)
-                else "."
+
+        oof = df[
+            df["kierunek_energii_norm"].eq(direction)
+            & df["status_predykcji"].eq("OOF_BACKTEST")
+        ]
+        if oof.empty:
+            final_selection = _fallback_selection("BRAK_OOF_DO_KALIBRACJI_FINALNEJ")
+        else:
+            final_selection = _select_blend_alpha(
+                oof["wartosc_rzeczywista"],
+                oof["wartosc_bazowa_backtest"],
+                oof["korekta_ml_surowa"],
+                min_rows=config.min_calibration_rows,
+                min_improvement=config.min_blend_improvement,
+                grid_steps=config.blend_grid_steps,
             )
+
+        usable_train_rows = int(
+            (
+                train["wartosc_rzeczywista"].notna()
+                & train["wartosc_bazowa"].notna()
+            ).sum()
         )
-        models[direction] = model
-        full_prediction = _predict_original_scale(model, predict_frame, spec)
+        final_model = None
+        stopped_by_time = False
+        if usable_train_rows >= config.min_train_rows:
+            fit_started = time.monotonic()
+            progress(
+                f"Model końcowy {direction}: uczę korektę na "
+                f"{usable_train_rows:,} wierszach; alpha={final_selection.alpha:.2f}..."
+            )
+            final_model = _fit_residual_model(train, spec, config)
+            stopped_by_time = bool(
+                getattr(final_model, "_mdd_stopped_by_time", False)
+            )
+            progress(
+                f"Model końcowy {direction}: gotowe po "
+                f"{time.monotonic() - fit_started:.1f} s"
+                + (
+                    " (zatrzymano limitem czasu)."
+                    if stopped_by_time
+                    else "."
+                )
+            )
+        else:
+            final_selection = _fallback_selection(
+                "ZA_MALO_DANYCH_DO_MODELU_KONCOWEGO",
+                n=final_selection.n,
+            )
+            progress(
+                f"Model końcowy {direction}: brak wystarczających lagów; "
+                "prognoza pozostaje baseline."
+            )
+
+        artifact = HybridModelArtifact(
+            estimator=final_model,
+            alpha=final_selection.alpha,
+            calibration_n=final_selection.n,
+            calibration_improvement=final_selection.improvement,
+            calibration_reason=final_selection.reason,
+        )
+        models[direction] = artifact
+
+        baseline_full = _baseline_for_fold(history, predict_frame)
+        if final_model is None:
+            correction_full = np.zeros(len(predict_frame), dtype=float)
+        else:
+            correction_full = _predict_residual_correction(
+                final_model, predict_frame, spec
+            )
+        raw_full = _blend_prediction(baseline_full, correction_full, 1.0)
+        full_prediction = _blend_prediction(
+            baseline_full, correction_full, final_selection.alpha
+        )
         df.loc[predict_frame.index, "wartosc_model_pelny"] = full_prediction
-        future_index = predict_frame.index[future_mask.reindex(predict_frame.index, fill_value=False)]
+
+        future_index = predict_frame.index[
+            future_mask.reindex(predict_frame.index, fill_value=False)
+        ]
         if len(future_index):
-            df.loc[future_index, "wartosc_przewidywana"] = df.loc[
-                future_index, "wartosc_model_pelny"
+            positions = predict_frame.index.get_indexer(future_index)
+            df.loc[future_index, "wartosc_bazowa_backtest"] = baseline_full.loc[
+                future_index
             ]
+            df.loc[future_index, "korekta_ml_surowa"] = correction_full[positions]
+            df.loc[future_index, "wartosc_ml_przed_blendem"] = raw_full[positions]
+            df.loc[future_index, "blend_alpha"] = final_selection.alpha
+            df.loc[future_index, "strategia_predykcji"] = (
+                "HYBRYDA_FINALNA"
+                if final_selection.alpha > 0
+                else "BASELINE_FALLBACK_FINALNY"
+            )
+            df.loc[future_index, "kalibracja_n"] = final_selection.n
+            df.loc[future_index, "kalibracja_poprawa_mae"] = (
+                final_selection.improvement
+            )
+            df.loc[future_index, "kalibracja_powod"] = final_selection.reason
+            df.loc[future_index, "fit_zatrzymany_limitem"] = stopped_by_time
+            df.loc[future_index, "wartosc_przewidywana"] = full_prediction[positions]
             df.loc[future_index, "status_predykcji"] = "PROGNOZA_PRZYSZLA"
             matched_weather = df.get(
                 "pogoda_dopasowana", pd.Series(False, index=df.index)
@@ -436,11 +781,19 @@ def run_forecasting(
     evaluated = df[df["status_predykcji"].eq("OOF_BACKTEST")].copy()
     metric_rows: list[dict[str, Any]] = []
     if not evaluated.empty:
-        metric_rows.extend(_metrics_by_scope(evaluated, "wartosc_przewidywana", "ML_OOF"))
-        baseline_eval = evaluated[evaluated["wartosc_bazowa_backtest"].notna()]
+        metric_rows.extend(
+            _metrics_by_scope(evaluated, "wartosc_przewidywana", "HYBRYDA_OOF")
+        )
         metric_rows.extend(
             _metrics_by_scope(
-                baseline_eval,
+                evaluated,
+                "wartosc_ml_przed_blendem",
+                "KOREKTA_ML_SUROWA_OOF",
+            )
+        )
+        metric_rows.extend(
+            _metrics_by_scope(
+                evaluated,
                 "wartosc_bazowa_backtest",
                 "SREDNIA_ANALOGICZNYCH_D3_D14",
             )
@@ -460,23 +813,26 @@ def run_forecasting(
         ],
     )
 
+    importance_column = "waznosc_permutacyjna_residuum_mae"
     if importances:
         importance_raw = pd.DataFrame(importances)
         importance = (
             importance_raw.groupby(["kierunek", "cecha"], as_index=False)
             .agg(
-                waznosc_permutacyjna_log_mae=("waznosc_permutacyjna_log_mae", "mean"),
-                odchylenie_miedzy_foldami=("waznosc_permutacyjna_log_mae", "std"),
+                waznosc_permutacyjna_residuum_mae=(importance_column, "mean"),
+                odchylenie_miedzy_foldami=(importance_column, "std"),
                 liczba_foldow=("fold", "nunique"),
             )
-            .sort_values(["kierunek", "waznosc_permutacyjna_log_mae"], ascending=[True, False])
+            .sort_values(
+                ["kierunek", importance_column], ascending=[True, False]
+            )
         )
     else:
         importance = pd.DataFrame(
             columns=[
                 "kierunek",
                 "cecha",
-                "waznosc_permutacyjna_log_mae",
+                importance_column,
                 "odchylenie_miedzy_foldami",
                 "liczba_foldow",
             ]
